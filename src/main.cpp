@@ -1,9 +1,9 @@
 #include <Arduino.h>
 #include <time.h>
+#include <ArduinoJson.h>
 
 
-#include "sensesp/signalk/signalk_output.h"
-#include "sensesp/signalk/signalk_put_request_listener.h"
+#include "sensesp/signalk/signalk_value_listener.h"
 #include "sensesp/ui/config_item.h"
 #include "sensesp_app_builder.h"
 #include "sensesp/system/serializable.h"
@@ -42,18 +42,12 @@ class AnchorController : public FileSystemSaveable {
   enum RunState { IDLE, RUNNING_UP, RUNNING_DOWN, FAULT };
   RunState state = IDLE;
 
-  // SK Outputs
-  SKOutput<String>* sk_state         = nullptr;
-  SKOutput<bool>*   sk_enabled       = nullptr;
-  SKOutput<float>*  sk_default_chain = nullptr;
-  SKOutput<String>* sk_last_update   = nullptr;
-  SKOutput<String>* sk_last_command  = nullptr;
+  // Custom heartbeat publisher via WS (no SKOutput)
 
-  // PUT listeners
-  SKPutRequestListener<float>* put_run_down       = nullptr;
-  SKPutRequestListener<float>* put_run_up         = nullptr;
-  SKPutRequestListener<bool>*  put_stop           = nullptr;
-  SKPutRequestListener<float>* put_default_chain  = nullptr;
+  // SK Listeners (incoming commands via SK state paths)
+  StringSKListener* sk_state_listener   = nullptr;  // listens to sensors.akat.anchor.state
+
+  // No PUT listeners: control is via SK value listeners
 
   // timers
   unsigned long op_end_ms = 0;
@@ -100,16 +94,34 @@ class AnchorController : public FileSystemSaveable {
     }
     return "idle";
   }
-  void publishAll() {
-    if (sk_enabled)       sk_enabled->set(enabled);
-    if (sk_default_chain) sk_default_chain->set(default_chain_seconds);
-    if (sk_state)         sk_state->set(stateToString_());
-    if (sk_last_update)   sk_last_update->set(isoTimestamp());
+  void sendHeartbeat(bool include_enabled = false) {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return;
+    auto ws = app->get_ws_client();
+    if (!ws) return;
+    JsonDocument doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "signalk-anchoralarm-akat";
+    JsonArray values = upd["values"].to<JsonArray>();
+    if (include_enabled) {
+      JsonObject v1 = values.add<JsonObject>();
+      v1["path"] = "sensors.akat.anchor.enabled";
+      v1["value"] = enabled;
+    }
+    JsonObject v2 = values.add<JsonObject>();
+    v2["path"] = "sensors.akat.anchor.lastUpdate";
+    v2["value"] = isoTimestamp();
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
   }
+  // Minimal wrapper to touch heartbeat when needed
   void publishState_(const char* last_cmd = nullptr) {
-    if (sk_state)       sk_state->set(stateToString_());
-    if (sk_last_update) sk_last_update->set(isoTimestamp());
-    if (last_cmd && sk_last_command) sk_last_command->set(String(last_cmd));
+    sendHeartbeat(false);
   }
 
   // ---- Core ops ----
@@ -118,7 +130,7 @@ class AnchorController : public FileSystemSaveable {
     state = IDLE;
     op_end_ms = 0;
     neutral_waiting = false;
-    publishState_(reason);
+    // no-op for state publishing; heartbeat continues separately
   }
   void startRun_(RunState dir, float seconds) {
     const unsigned long now_ms = millis();
@@ -126,11 +138,11 @@ class AnchorController : public FileSystemSaveable {
     if (dir == RUNNING_UP) {
       relayUpOn_();
       state = RUNNING_UP;
-      publishState_("up:start");
+      // heartbeat touches handled on timer
     } else {
       relayDownOn_();
       state = RUNNING_DOWN;
-      publishState_("down:start");
+      // heartbeat touches handled on timer
     }
   }
   void runDirection_(RunState dir, float seconds) {
@@ -150,7 +162,7 @@ class AnchorController : public FileSystemSaveable {
       neutral_until_ms = now_ms + (unsigned long)neutral_ms;
       queued_dir_ = dir;
       queued_dur_s_ = dur;
-      publishState_(dir == RUNNING_UP ? "up:queued" : "down:queued");
+      // queued; heartbeat timer continues
       return;
     }
 
@@ -163,7 +175,7 @@ class AnchorController : public FileSystemSaveable {
       unsigned long max_ms = (unsigned long)(max_run_seconds * 1000.0f);
       if (new_total > max_ms) new_total = max_ms;
       op_end_ms = now_ms + new_total;
-      publishState_(dir == RUNNING_UP ? "up:extend" : "down:extend");
+      // extend; heartbeat timer continues
       return;
     }
 
@@ -171,7 +183,7 @@ class AnchorController : public FileSystemSaveable {
     if (neutral_waiting && now_ms < neutral_until_ms) {
       queued_dir_ = dir;
       queued_dur_s_ = dur;
-      publishState_("queued_after_neutral");
+      // queued after neutral; heartbeat timer continues
       return;
     }
 
@@ -194,9 +206,9 @@ class AnchorController : public FileSystemSaveable {
       stopNow_(state == RUNNING_UP ? "up:done" : "down:done");
     }
 
-    // Update Signal K timestamp every 2 seconds
-    if (sk_last_update && (now_ms - last_sk_update_ms_ >= 2000)) {
-      sk_last_update->set(isoTimestamp());
+    // Heartbeat to Signal K every 2 seconds (custom source label)
+    if (now_ms - last_sk_update_ms_ >= 2000) {
+      sendHeartbeat(false);
       last_sk_update_ms_ = now_ms;
     }
 
@@ -237,7 +249,8 @@ class AnchorController : public FileSystemSaveable {
     if (c.containsKey("max_run_seconds")) max_run_seconds = c["max_run_seconds"].as<float>();
     if (c.containsKey("neutral_ms")) neutral_ms = c["neutral_ms"].as<int>();
     setupPins();
-    publishAll();
+    // Touch heartbeat after config update
+    sendHeartbeat(false);
     return true;
   }
   String get_config_schema() const {
@@ -259,36 +272,38 @@ class AnchorController : public FileSystemSaveable {
 
   // ---------- Signal K glue ----------
   void attachSignalK() {
-    // Outputs
-    sk_state         = new SKOutput<String>("sensors.akat.anchor.state");
-    sk_enabled       = new SKOutput<bool>("sensors.akat.anchor.enabled");
-    sk_default_chain = new SKOutput<float>("sensors.akat.anchor.defaultChainSeconds");
-    sk_last_update   = new SKOutput<String>("sensors.akat.anchor.lastUpdate");
-    sk_last_command  = new SKOutput<String>("sensors.akat.anchor.lastCommand");
-    publishAll();
+    // No SKOutput - use custom WS deltas with explicit source label
 
-    // PUT listeners (v3: constructor takes only path; connect with LambdaConsumer)
-    put_run_down = new SKPutRequestListener<float>("sensors.akat.anchor.runDown");
-    put_run_down->connect_to(new LambdaConsumer<float>([this](float seconds) {
-      runDirection_(RUNNING_DOWN, seconds);
+    // Listeners for remote control via Signal K value changes
+    sk_state_listener = new StringSKListener("sensors.akat.anchor.state", 300);
+    sk_state_listener->connect_to(new LambdaConsumer<String>([this](const String& cmd_state) {
+      // React to remote state commands: running_up / running_down / idle
+      if (cmd_state == "running_up") {
+        if (state != RUNNING_UP) {
+          // Run until told to stop (capped by max_run_seconds)
+          runDirection_(RUNNING_UP, max_run_seconds);
+        }
+      } else if (cmd_state == "running_down") {
+        if (state != RUNNING_DOWN) {
+          runDirection_(RUNNING_DOWN, max_run_seconds);
+        }
+      } else if (cmd_state == "freefall") {
+        // Drop for defaultChainSeconds
+        runDirection_(RUNNING_DOWN, 0.0f);
+      } else if (cmd_state == "idle") {
+        if (state != IDLE) {
+          stopNow_("idle:remote");
+        }
+      }
     }));
 
-    put_run_up = new SKPutRequestListener<float>("sensors.akat.anchor.runUp");
-    put_run_up->connect_to(new LambdaConsumer<float>([this](float seconds) {
-      runDirection_(RUNNING_UP, seconds);
-    }));
-
-    put_stop = new SKPutRequestListener<bool>("sensors.akat.anchor.stop");
-    put_stop->connect_to(new LambdaConsumer<bool>([this](bool do_stop) {
-      if (do_stop) stopNow_("stop:put");
-    }));
-
-    put_default_chain = new SKPutRequestListener<float>("sensors.akat.anchor.defaultChainSeconds");
-    put_default_chain->connect_to(new LambdaConsumer<float>([this](float secs) {
+    // Listen for defaultChainSeconds updates from Signal K
+    auto default_chain_listener = new FloatSKListener("sensors.akat.anchor.defaultChainSeconds", 500);
+    default_chain_listener->connect_to(new LambdaConsumer<float>([this](float secs) {
       float v = secs < 0 ? 0.0f : secs;
       default_chain_seconds = v;
-      if (sk_default_chain) sk_default_chain->set(default_chain_seconds);
-      if (sk_last_update)   sk_last_update->set(isoTimestamp());
+      // Touch heartbeat on config change
+      sendHeartbeat(false);
     }));
   }
 };
@@ -327,19 +342,19 @@ void setup() {
 
   anchor->setupPins();
   anchor->attachSignalK();
-  anchor->publishAll();
+  // Initial heartbeat and enabled=true via WS delta on connect
 
   // Prepare onboard LED for blink indication
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  // Re-publish defaults whenever Signal K websocket connects
+  // On WS connect, send enabled=true and initial heartbeat
   if (auto app = ::sensesp::SensESPApp::get()) {
     auto ws = app->get_ws_client();
     if (ws) {
       ws->connect_to(new LambdaConsumer<SKWSConnectionState>([](SKWSConnectionState state) {
         if (state == SKWSConnectionState::kSKWSConnected) {
-          if (anchor) anchor->publishAll();
+          if (anchor) anchor->sendHeartbeat(true);
         }
       }));
     }

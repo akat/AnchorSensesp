@@ -94,6 +94,43 @@ class AnchorController : public FileSystemSaveable {
     }
     return "idle";
   }
+  // ---- Signal K delta helpers ----
+  void sendSkDeltaBool_(const char* path, bool value) {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return;
+    auto ws = app->get_ws_client();
+    if (!ws) return;
+    StaticJsonDocument<256> doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonArray values = upd["values"].to<JsonArray>();
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
+    v["value"] = value;
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
+  }
+  void sendSkDeltaString_(const char* path, const String& value) {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return;
+    auto ws = app->get_ws_client();
+    if (!ws) return;
+    StaticJsonDocument<256> doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonArray values = upd["values"].to<JsonArray>();
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
+    v["value"] = value;
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
+  }
   void sendHeartbeat(bool include_enabled = false) {
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
@@ -138,11 +175,11 @@ class AnchorController : public FileSystemSaveable {
     if (dir == RUNNING_UP) {
       relayUpOn_();
       state = RUNNING_UP;
-      // heartbeat touches handled on timer
+      publishState_("up:start");
     } else {
       relayDownOn_();
       state = RUNNING_DOWN;
-      // heartbeat touches handled on timer
+      publishState_("down:start");
     }
   }
   void runDirection_(RunState dir, float seconds) {
@@ -162,7 +199,7 @@ class AnchorController : public FileSystemSaveable {
       neutral_until_ms = now_ms + (unsigned long)neutral_ms;
       queued_dir_ = dir;
       queued_dur_s_ = dur;
-      // queued; heartbeat timer continues
+      publishState_("queued:neutral");
       return;
     }
 
@@ -175,7 +212,7 @@ class AnchorController : public FileSystemSaveable {
       unsigned long max_ms = (unsigned long)(max_run_seconds * 1000.0f);
       if (new_total > max_ms) new_total = max_ms;
       op_end_ms = now_ms + new_total;
-      // extend; heartbeat timer continues
+      publishState_("extend");
       return;
     }
 
@@ -183,7 +220,7 @@ class AnchorController : public FileSystemSaveable {
     if (neutral_waiting && now_ms < neutral_until_ms) {
       queued_dir_ = dir;
       queued_dur_s_ = dur;
-      // queued after neutral; heartbeat timer continues
+      publishState_("queued:after_neutral");
       return;
     }
 
@@ -206,9 +243,14 @@ class AnchorController : public FileSystemSaveable {
       stopNow_(state == RUNNING_UP ? "up:done" : "down:done");
     }
 
-    // Heartbeat to Signal K every 2 seconds (custom source label)
+    // Heartbeat to Signal K every 2 seconds; reinforce lastCommand while running
     if (now_ms - last_sk_update_ms_ >= 2000) {
       sendHeartbeat(false);
+      if (state == RUNNING_UP) {
+        sendSkDeltaString_("sensors.akat.anchor.lastCommand", String("up:run"));
+      } else if (state == RUNNING_DOWN) {
+        sendSkDeltaString_("sensors.akat.anchor.lastCommand", String("down:run"));
+      }
       last_sk_update_ms_ = now_ms;
     }
 

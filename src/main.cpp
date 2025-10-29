@@ -20,7 +20,7 @@ static String isoTimestamp() {
   return String(buf);
 }
 
-// ---------- AnchorController ----------
+// ---------- AnchorController with Chain Counter ----------
 class AnchorController : public FileSystemSaveable {
  public:
   AnchorController() : FileSystemSaveable("/sensors/akat/anchor") {}
@@ -32,6 +32,18 @@ class AnchorController : public FileSystemSaveable {
   bool enabled             = true;
   float default_chain_seconds = 5.0f;
   int   neutral_ms            = 400;
+  
+  // Chain counter configuration
+  int  chain_sensor_pin    = 25;       // GPIO για την μαγνητική επαφή
+  bool chain_sensor_pullup = true;     // Ενεργοποίηση εσωτερικού pull-up
+  float chain_calibration  = 1.0f;     // Μέτρα ανά παλμό (συνήθως 1 μέτρο/κρίκος)
+  
+  // Chain counter state
+  float chain_out_meters   = 0.0f;     // Πόσα μέτρα αλυσίδα έχουν βγει
+  int   chain_pulse_count  = 0;        // Μετρητής παλμών
+  bool  last_sensor_state  = HIGH;     // Προηγούμενη κατάσταση αισθητήρα
+  unsigned long last_pulse_ms = 0;     // Τελευταίος παλμός (για debounce)
+  const unsigned long pulse_debounce_ms = 50; // Debounce 50ms
 
   // Runtime state
   enum RunState { IDLE, RUNNING_UP, RUNNING_DOWN, FAULT };
@@ -62,9 +74,21 @@ class AnchorController : public FileSystemSaveable {
 
   // ---- Pin IO ----
   void setupPins() {
+    // Relay pins
     pinMode(relay_up_pin, OUTPUT);
     pinMode(relay_down_pin, OUTPUT);
     relaysOff_();
+    
+    // Chain counter sensor pin
+    if (chain_sensor_pullup) {
+      pinMode(chain_sensor_pin, INPUT_PULLUP);
+    } else {
+      pinMode(chain_sensor_pin, INPUT);
+    }
+    last_sensor_state = digitalRead(chain_sensor_pin);
+    
+    ESP_LOGI(TAG, "Chain counter initialized: pin=%d, pullup=%d, cal=%.2fm/pulse", 
+             chain_sensor_pin, chain_sensor_pullup, chain_calibration);
   }
   
   inline void relaysOff_() {
@@ -85,6 +109,80 @@ class AnchorController : public FileSystemSaveable {
     relays_on_ = true;
   }
 
+  // ---- Chain Counter Logic ----
+  void updateChainCounter() {
+    // Διάβασε την κατάσταση του αισθητήρα
+    bool current_state = digitalRead(chain_sensor_pin);
+    unsigned long now_ms = millis();
+    
+    // Ανίχνευση μετάβασης LOW→HIGH (όταν η μαγνητική επαφή ανοίξει)
+    if (current_state == HIGH && last_sensor_state == LOW) {
+      // Debounce: αγνόησε παλμούς που είναι πολύ κοντά
+      if (now_ms - last_pulse_ms > pulse_debounce_ms) {
+        last_pulse_ms = now_ms;
+        
+        // Μέτρησε ανάλογα με την κατεύθυνση
+        if (state == RUNNING_DOWN) {
+          // Κατέβασμα αγκύρας → αύξηση μέτρων
+          chain_out_meters += chain_calibration;
+          chain_pulse_count++;
+          ESP_LOGI(TAG, "Chain OUT: %.1fm (pulse #%d)", chain_out_meters, chain_pulse_count);
+        } else if (state == RUNNING_UP) {
+          // Ανέβασμα αγκύρας → μείωση μέτρων
+          chain_out_meters -= chain_calibration;
+          if (chain_out_meters < 0.0f) chain_out_meters = 0.0f; // Δεν πάει αρνητικό
+          chain_pulse_count--;
+          if (chain_pulse_count < 0) chain_pulse_count = 0;
+          ESP_LOGI(TAG, "Chain IN: %.1fm (pulse #%d)", chain_out_meters, chain_pulse_count);
+        }
+        
+        // Στείλε ενημέρωση στο Signal K
+        sendChainUpdate_();
+      }
+    }
+    
+    last_sensor_state = current_state;
+  }
+  
+  void resetChainCounter() {
+    chain_out_meters = 0.0f;
+    chain_pulse_count = 0;
+    ESP_LOGI(TAG, "Chain counter reset to 0");
+    sendChainUpdate_();
+  }
+  
+  void sendChainUpdate_() {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return;
+    auto ws = app->get_ws_client();
+    if (!ws) return;
+    extern SKWSConnectionState g_ws_state;
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
+    
+    JsonDocument doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "signalk-anchoralarm-akat";
+    JsonArray values = upd["values"].to<JsonArray>();
+    
+    // Μέτρα αλυσίδας
+    JsonObject v1 = values.add<JsonObject>();
+    v1["path"] = "sensors.akat.anchor.chainOut";
+    v1["value"] = chain_out_meters;
+    
+    // Αριθμός παλμών
+    JsonObject v2 = values.add<JsonObject>();
+    v2["path"] = "sensors.akat.anchor.chainPulses";
+    v2["value"] = chain_pulse_count;
+    
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
+  }
+
   // ---- Publish helpers ----
   String stateToString_() const {
     switch (state) {
@@ -103,9 +201,7 @@ class AnchorController : public FileSystemSaveable {
     auto ws = app->get_ws_client();
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return;
-    }
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
     
     JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
@@ -127,9 +223,7 @@ class AnchorController : public FileSystemSaveable {
     auto ws = app->get_ws_client();
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return;
-    }
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
     
     JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
@@ -151,9 +245,7 @@ class AnchorController : public FileSystemSaveable {
     auto ws = app->get_ws_client();
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return;
-    }
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
     
     JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
@@ -173,6 +265,11 @@ class AnchorController : public FileSystemSaveable {
     JsonObject v2 = values.add<JsonObject>();
     v2["path"] = "sensors.akat.anchor.lastUpdate";
     v2["value"] = isoTimestamp();
+    
+    // Συμπεριέλαβε την μέτρηση αλυσίδας στο heartbeat
+    JsonObject v3 = values.add<JsonObject>();
+    v3["path"] = "sensors.akat.anchor.chainOut";
+    v3["value"] = chain_out_meters;
     
     String payload;
     serializeJson(doc, payload);
@@ -279,6 +376,9 @@ class AnchorController : public FileSystemSaveable {
       }
     }
 
+    // Update chain counter (ανεξάρτητα από την κατάσταση σύνδεσης)
+    updateChainCounter();
+
     // Process neutral wait queue
     if (neutral_waiting && now_ms >= neutral_until_ms) {
       neutral_waiting = false;
@@ -335,6 +435,10 @@ class AnchorController : public FileSystemSaveable {
     root["enabled"] = enabled;
     root["default_chain_seconds"] = default_chain_seconds;
     root["neutral_ms"] = neutral_ms;
+    root["chain_sensor_pin"] = chain_sensor_pin;
+    root["chain_sensor_pullup"] = chain_sensor_pullup;
+    root["chain_calibration"] = chain_calibration;
+    root["chain_out_meters"] = chain_out_meters;  // Αποθήκευση της τρέχουσας μέτρησης
     return true;
   }
 
@@ -345,6 +449,10 @@ class AnchorController : public FileSystemSaveable {
     if (c["enabled"].is<bool>()) enabled = c["enabled"].as<bool>();
     if (c["default_chain_seconds"].is<float>()) default_chain_seconds = c["default_chain_seconds"].as<float>();
     if (c["neutral_ms"].is<int>()) neutral_ms = c["neutral_ms"].as<int>();
+    if (c["chain_sensor_pin"].is<int>()) chain_sensor_pin = c["chain_sensor_pin"].as<int>();
+    if (c["chain_sensor_pullup"].is<bool>()) chain_sensor_pullup = c["chain_sensor_pullup"].as<bool>();
+    if (c["chain_calibration"].is<float>()) chain_calibration = c["chain_calibration"].as<float>();
+    if (c["chain_out_meters"].is<float>()) chain_out_meters = c["chain_out_meters"].as<float>();
     setupPins();
     return true;
   }
@@ -358,13 +466,17 @@ class AnchorController : public FileSystemSaveable {
         "relays_active_high":{"title":"Relays Active HIGH","type":"boolean"},
         "enabled":{"title":"Enabled","type":"boolean"},
         "default_chain_seconds":{"title":"Default Seconds","type":"number","minimum":0},
-        "neutral_ms":{"title":"Neutral Delay (ms)","type":"integer","minimum":0}
+        "neutral_ms":{"title":"Neutral Delay (ms)","type":"integer","minimum":0},
+        "chain_sensor_pin":{"title":"Chain Sensor GPIO","type":"integer"},
+        "chain_sensor_pullup":{"title":"Enable Internal Pull-up","type":"boolean"},
+        "chain_calibration":{"title":"Meters per Pulse","type":"number","minimum":0.1}
       }
     })###");
   }
 
   // ---------- Signal K integration ----------
   void attachSignalK() {
+    // State listener
     sk_state_listener = new StringSKListener("sensors.akat.anchor.state", 300);
     sk_state_listener->connect_to(new LambdaConsumer<String>([this](const String& cmd_state) {
       extern SKWSConnectionState g_ws_state;
@@ -394,17 +506,29 @@ class AnchorController : public FileSystemSaveable {
         if (state != IDLE) {
           stopNow_("idle:remote");
         }
+      } else if (cmd_state == "reset_counter") {
+        // Εντολή για reset του μετρητή αλυσίδας
+        resetChainCounter();
       }
     }));
 
+    // Default chain seconds listener
     auto default_chain_listener = new FloatSKListener("sensors.akat.anchor.defaultChainSeconds", 500);
     default_chain_listener->connect_to(new LambdaConsumer<float>([this](float secs) {
       extern SKWSConnectionState g_ws_state;
-      if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-        return;
-      }
+      if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
       float v = secs < 0 ? 0.0f : secs;
       default_chain_seconds = v;
+    }));
+    
+    // Chain counter reset listener
+    auto chain_reset_listener = new BoolSKListener("sensors.akat.anchor.resetChainCounter", 500);
+    chain_reset_listener->connect_to(new LambdaConsumer<bool>([this](bool reset) {
+      extern SKWSConnectionState g_ws_state;
+      if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
+      if (reset) {
+        resetChainCounter();
+      }
     }));
   }
 };
@@ -436,7 +560,7 @@ void setup() {
 
   ConfigItem(anchor)
     ->set_title("Anchor Controller")
-    ->set_description("Relay control & timings for anchor windlass")
+    ->set_description("Relay control & timings for anchor windlass with chain counter")
     ->set_sort_order(100)
     ->set_config_schema(anchor->get_config_schema());
 
@@ -484,6 +608,8 @@ void setup() {
       }));
     }
   }
+  
+  ESP_LOGI(TAG, "Anchor Windlass Controller with Chain Counter initialized");
 }
 
 void loop() {

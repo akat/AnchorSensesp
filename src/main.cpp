@@ -272,6 +272,16 @@ class AnchorController : public FileSystemSaveable {
   void tick() {
     const unsigned long now_ms = millis();
 
+    // SAFETY: Check connection state and stop if disconnected
+    extern SKWSConnectionState g_ws_state;
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
+      if (state == RUNNING_UP || state == RUNNING_DOWN) {
+        ESP_LOGW(TAG, "SAFETY: Motor running while disconnected - stopping");
+        stopNow_("safety:not_connected");
+        return;
+      }
+    }
+
     // Process neutral wait queue
     if (neutral_waiting && now_ms >= neutral_until_ms) {
       neutral_waiting = false;
@@ -461,6 +471,12 @@ void setup() {
           case SKWSConnectionState::kSKWSDisconnected:
             ESP_LOGW(TAG, "SK WS: Disconnected");
             g_connection_time = 0;
+            // SAFETY: Stop motor immediately when connection is lost
+            if (anchor && (anchor->state == AnchorController::RUNNING_UP || 
+                          anchor->state == AnchorController::RUNNING_DOWN)) {
+              ESP_LOGW(TAG, "SAFETY: Stopping motor due to SignalK disconnection");
+              anchor->stopNow_("safety:disconnected");
+            }
             break;
             
           case SKWSConnectionState::kSKWSAuthorizing:

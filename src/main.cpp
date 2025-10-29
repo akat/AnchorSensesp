@@ -31,7 +31,6 @@ class AnchorController : public FileSystemSaveable {
   bool relays_active_high  = true;
   bool enabled             = true;
   float default_chain_seconds = 5.0f;
-  float max_run_seconds       = 120.0f;
   int   neutral_ms            = 400;
 
   // Runtime state
@@ -43,6 +42,7 @@ class AnchorController : public FileSystemSaveable {
 
   // Timers
   unsigned long op_end_ms = 0;
+  unsigned long op_start_ms = 0;
   bool          neutral_waiting = false;
   unsigned long neutral_until_ms = 0;
   RunState      queued_dir_ = IDLE;
@@ -54,12 +54,10 @@ class AnchorController : public FileSystemSaveable {
   bool          led_state_ = false;
   bool          relays_on_ = false;
 
-  // FIX: Command debouncing to prevent listener flooding
+  // Command debouncing
   unsigned long last_command_ms_ = 0;
   const unsigned long command_debounce_ms_ = 250;
   String last_command_state_ = "";
-
-  // FIX: Track if we're in the middle of processing commands
   bool processing_command_ = false;
 
   // ---- Pin IO ----
@@ -106,7 +104,7 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return; // Silently skip if not connected
+      return;
     }
     
     JsonDocument doc;
@@ -130,7 +128,7 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return; // Silently skip if not connected
+      return;
     }
     
     JsonDocument doc;
@@ -154,7 +152,7 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-      return; // Skip if not connected
+      return;
     }
     
     JsonDocument doc;
@@ -181,10 +179,8 @@ class AnchorController : public FileSystemSaveable {
     ws->sendTXT(payload);
   }
 
-  // FIX: Remove redundant publishState to reduce WS traffic
   void publishState_(const char* last_cmd = nullptr) {
-    // State publishing happens via periodic heartbeat in tick()
-    // No immediate WS send to avoid flooding during reconnection
+    // State publishing happens via periodic heartbeat
   }
 
   // ---- Core operations ----
@@ -192,11 +188,13 @@ class AnchorController : public FileSystemSaveable {
     relaysOff_();
     state = IDLE;
     op_end_ms = 0;
+    op_start_ms = 0;
     neutral_waiting = false;
   }
 
   void startRun_(RunState dir, float seconds) {
     const unsigned long now_ms = millis();
+    op_start_ms = now_ms;
     op_end_ms = now_ms + (unsigned long)(seconds * 1000.0f);
     if (dir == RUNNING_UP) {
       relayUpOn_();
@@ -210,14 +208,12 @@ class AnchorController : public FileSystemSaveable {
   void runDirection_(RunState dir, float seconds) {
     if (!enabled) return;
 
-    // FIX: Prevent re-entrant calls and rapid command flooding
     if (processing_command_) {
       ESP_LOGD(TAG, "Ignoring command - already processing");
       return;
     }
     processing_command_ = true;
 
-    // FIX: Debounce identical commands
     const unsigned long now_ms = millis();
     String current_cmd = (dir == RUNNING_UP) ? "up" : (dir == RUNNING_DOWN) ? "down" : "idle";
     if (current_cmd == last_command_state_ && 
@@ -230,7 +226,6 @@ class AnchorController : public FileSystemSaveable {
 
     float dur = seconds;
     if (dur <= 0.0f) dur = default_chain_seconds;
-    if (dur > max_run_seconds) dur = max_run_seconds;
 
     // Change direction → neutral pause
     if ((dir == RUNNING_UP && state == RUNNING_DOWN) ||
@@ -250,9 +245,11 @@ class AnchorController : public FileSystemSaveable {
       unsigned long remaining = (op_end_ms > now_ms) ? (op_end_ms - now_ms) : 0;
       unsigned long add_ms = (unsigned long)(dur * 1000.0f);
       unsigned long new_total = remaining + add_ms;
-      unsigned long max_ms = (unsigned long)(max_run_seconds * 1000.0f);
-      if (new_total > max_ms) new_total = max_ms;
+      
       op_end_ms = now_ms + new_total;
+      
+      ESP_LOGI(TAG, "Extended runtime: new end in %.1fs", new_total / 1000.0f);
+      
       processing_command_ = false;
       return;
     }
@@ -300,13 +297,11 @@ class AnchorController : public FileSystemSaveable {
       stopNow_(state == RUNNING_UP ? "up:done" : "down:done");
     }
 
-    // FIX: Only send heartbeat if connected, and reduce frequency during active operations
-    extern SKWSConnectionState g_ws_state;
+    // Send heartbeat if connected
     if (g_ws_state == SKWSConnectionState::kSKWSConnected) {
       if (now_ms - last_sk_update_ms_ >= 2000) {
         sendHeartbeat(false);
         
-        // Send current command state while running
         if (state == RUNNING_UP) {
           sendSkDeltaString_("sensors.akat.anchor.lastCommand", String("up:run"));
         } else if (state == RUNNING_DOWN) {
@@ -339,7 +334,6 @@ class AnchorController : public FileSystemSaveable {
     root["relays_active_high"] = relays_active_high;
     root["enabled"] = enabled;
     root["default_chain_seconds"] = default_chain_seconds;
-    root["max_run_seconds"] = max_run_seconds;
     root["neutral_ms"] = neutral_ms;
     return true;
   }
@@ -350,7 +344,6 @@ class AnchorController : public FileSystemSaveable {
     if (c["relays_active_high"].is<bool>()) relays_active_high = c["relays_active_high"].as<bool>();
     if (c["enabled"].is<bool>()) enabled = c["enabled"].as<bool>();
     if (c["default_chain_seconds"].is<float>()) default_chain_seconds = c["default_chain_seconds"].as<float>();
-    if (c["max_run_seconds"].is<float>()) max_run_seconds = c["max_run_seconds"].as<float>();
     if (c["neutral_ms"].is<int>()) neutral_ms = c["neutral_ms"].as<int>();
     setupPins();
     return true;
@@ -365,7 +358,6 @@ class AnchorController : public FileSystemSaveable {
         "relays_active_high":{"title":"Relays Active HIGH","type":"boolean"},
         "enabled":{"title":"Enabled","type":"boolean"},
         "default_chain_seconds":{"title":"Default Seconds","type":"number","minimum":0},
-        "max_run_seconds":{"title":"Max Run Seconds","type":"number","minimum":1},
         "neutral_ms":{"title":"Neutral Delay (ms)","type":"integer","minimum":0}
       }
     })###");
@@ -373,32 +365,28 @@ class AnchorController : public FileSystemSaveable {
 
   // ---------- Signal K integration ----------
   void attachSignalK() {
-    // FIX: Add connection state check in listener callback
     sk_state_listener = new StringSKListener("sensors.akat.anchor.state", 300);
     sk_state_listener->connect_to(new LambdaConsumer<String>([this](const String& cmd_state) {
       extern SKWSConnectionState g_ws_state;
       extern unsigned long g_connection_time;
       
-      // FIX: Ignore listener updates during initial connection/reconnection
       if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
         ESP_LOGD(TAG, "Ignoring listener update - not connected");
         return;
       }
 
-      // FIX: Add small delay on first message after connection to let things settle
       if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) {
         ESP_LOGD(TAG, "Ignoring listener update - connection settling period");
         return;
       }
 
-      // Process commands
       if (cmd_state == "running_up") {
         if (state != RUNNING_UP) {
-          runDirection_(RUNNING_UP, max_run_seconds);
+          runDirection_(RUNNING_UP, 3600.0f);
         }
       } else if (cmd_state == "running_down") {
         if (state != RUNNING_DOWN) {
-          runDirection_(RUNNING_DOWN, max_run_seconds);
+          runDirection_(RUNNING_DOWN, 3600.0f);
         }
       } else if (cmd_state == "freefall") {
         runDirection_(RUNNING_DOWN, 0.0f);
@@ -409,7 +397,6 @@ class AnchorController : public FileSystemSaveable {
       }
     }));
 
-    // FIX: Add connection check to config listener too
     auto default_chain_listener = new FloatSKListener("sensors.akat.anchor.defaultChainSeconds", 500);
     default_chain_listener->connect_to(new LambdaConsumer<float>([this](float secs) {
       extern SKWSConnectionState g_ws_state;
@@ -432,7 +419,7 @@ inline const String ConfigSchema(const AnchorController& obj) {
 // --------- Globals ----------
 std::shared_ptr<AnchorController> anchor;
 SKWSConnectionState g_ws_state = SKWSConnectionState::kSKWSDisconnected;
-unsigned long g_connection_time = 0; // Track when connection was established
+unsigned long g_connection_time = 0;
 
 void setup() {
   SetupLogging();
@@ -459,7 +446,6 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
-  // FIX: Enhanced connection state tracking with settling period
   if (auto app = ::sensesp::SensESPApp::get()) {
     auto ws = app->get_ws_client();
     if (ws) {
@@ -471,7 +457,6 @@ void setup() {
           case SKWSConnectionState::kSKWSDisconnected:
             ESP_LOGW(TAG, "SK WS: Disconnected");
             g_connection_time = 0;
-            // SAFETY: Stop motor immediately when connection is lost
             if (anchor && (anchor->state == AnchorController::RUNNING_UP || 
                           anchor->state == AnchorController::RUNNING_DOWN)) {
               ESP_LOGW(TAG, "SAFETY: Stopping motor due to SignalK disconnection");
@@ -490,12 +475,6 @@ void setup() {
           case SKWSConnectionState::kSKWSConnected:
             ESP_LOGI(TAG, "SK WS: Connected");
             g_connection_time = millis();
-            // FIX: Send enabled=true immediately on connection
-            if (anchor) {
-              // Use a task to send after a small delay to ensure connection is stable
-              static unsigned long send_enabled_at = 0;
-              send_enabled_at = millis() + 500; // Send after 500ms
-            }
             break;
             
           default:
@@ -511,7 +490,6 @@ void loop() {
   event_loop()->tick();
   if (anchor) anchor->tick();
 
-  // FIX: Send enabled=true shortly after connection is established
   static bool enabled_sent = false;
   if (g_ws_state == SKWSConnectionState::kSKWSConnected && 
       g_connection_time > 0 && 
@@ -524,12 +502,10 @@ void loop() {
       enabled_sent = true;
     }
   }
-  // Reset flag when disconnected
   if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
     enabled_sent = false;
   }
 
-  // Periodic lightweight heartbeat every 30s (without enabled flag)
   static unsigned long last_hb = 0;
   auto app = ::sensesp::SensESPApp::get();
   if (app) {
@@ -543,7 +519,6 @@ void loop() {
     }
   }
 
-  // Periodic WiFi diagnostics
   static unsigned long last_wifi_log = 0;
   unsigned long now_ms = millis();
   if (now_ms - last_wifi_log > 60000UL) {
@@ -555,7 +530,6 @@ void loop() {
     }
   }
 
-  // FIX: Enhanced reconnect watchdog with better timing
   static unsigned long not_connected_since = 0;
   static uint8_t reconnect_attempts = 0;
   if (app) {
@@ -564,14 +538,12 @@ void loop() {
       if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
         if (not_connected_since == 0) not_connected_since = now_ms;
         
-        // FIX: Wait longer before forcing reconnect (60s instead of 45s)
         if (now_ms - not_connected_since > 60000UL) {
           ESP_LOGW(TAG, "WS watchdog: forcing reconnect (attempt %d)", reconnect_attempts + 1);
           ws->connect();
           not_connected_since = now_ms;
           reconnect_attempts++;
           
-          // FIX: Allow more attempts before restart (8 instead of 5)
           if (reconnect_attempts >= 8) {
             ESP_LOGE(TAG, "WS watchdog: exceeded attempts, restarting ESP32");
             delay(100);

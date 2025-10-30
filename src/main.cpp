@@ -37,6 +37,7 @@ class AnchorController : public FileSystemSaveable {
   int chain_sensor_pin = 25;
   bool chain_sensor_pullup = true;
   float chain_calibration = 1.0f;
+  int pulse_debounce_ms = 150;
 
   float chain_out_meters = 0.0f;
   int chain_pulse_count = 0;
@@ -44,7 +45,6 @@ class AnchorController : public FileSystemSaveable {
   unsigned long last_pulse_ms = 0;
   unsigned long sensor_stable_since = 0;
   bool sensor_stable_state = HIGH;
-  const unsigned long pulse_debounce_ms = 150;
 
   enum RunState { IDLE, RUNNING_UP, RUNNING_DOWN, FAULT };
   RunState state = IDLE;
@@ -123,12 +123,12 @@ class AnchorController : public FileSystemSaveable {
       last_sensor_state = current_state;
       sensor_stable_since = now_ms; return;
     }
-    if (now_ms - sensor_stable_since < pulse_debounce_ms) return;
+    if (now_ms - sensor_stable_since < (unsigned long)pulse_debounce_ms) return;
     if (current_state != sensor_stable_state) {
       bool old_stable = sensor_stable_state;
       sensor_stable_state = current_state;
       if (old_stable == LOW && sensor_stable_state == HIGH) {
-        if (now_ms - last_pulse_ms < pulse_debounce_ms * 2) return;
+        if (now_ms - last_pulse_ms < (unsigned long)pulse_debounce_ms * 2) return;
         last_pulse_ms = now_ms;
         if (state == RUNNING_DOWN) {
           chain_out_meters += chain_calibration; chain_pulse_count++;
@@ -458,6 +458,7 @@ class AnchorController : public FileSystemSaveable {
     root["chain_sensor_pin"] = chain_sensor_pin;
     root["chain_sensor_pullup"] = chain_sensor_pullup;
     root["chain_calibration"] = chain_calibration;
+    root["pulse_debounce_ms"] = pulse_debounce_ms;
     root["chain_out_meters"] = chain_out_meters;
     root["ext_up_gpio"] = ext_up_gpio;
     root["ext_down_gpio"] = ext_down_gpio;
@@ -480,6 +481,7 @@ class AnchorController : public FileSystemSaveable {
     if (c["chain_sensor_pin"].is<int>()) chain_sensor_pin = c["chain_sensor_pin"].as<int>();
     if (c["chain_sensor_pullup"].is<bool>()) chain_sensor_pullup = c["chain_sensor_pullup"].as<bool>();
     if (c["chain_calibration"].is<float>()) chain_calibration = c["chain_calibration"].as<float>();
+    if (c["pulse_debounce_ms"].is<int>()) pulse_debounce_ms = c["pulse_debounce_ms"].as<int>();
     if (c["chain_out_meters"].is<float>()) chain_out_meters = c["chain_out_meters"].as<float>();
     if (c["ext_up_gpio"].is<int>()) ext_up_gpio = c["ext_up_gpio"].as<int>();
     if (c["ext_down_gpio"].is<int>()) ext_down_gpio = c["ext_down_gpio"].as<int>();
@@ -505,6 +507,7 @@ class AnchorController : public FileSystemSaveable {
         "chain_sensor_pin":{"title":"Chain Sensor GPIO","type":"integer"},
         "chain_sensor_pullup":{"title":"Enable Internal Pull-up","type":"boolean"},
         "chain_calibration":{"title":"Meters per Pulse","type":"number","minimum":0.1},
+        "pulse_debounce_ms":{"title":"Pulse Debounce (ms)","type":"integer","minimum":50,"maximum":500},
         "ext_up_gpio":{"title":"EXT UP GPIO","type":"integer"},
         "ext_down_gpio":{"title":"EXT DOWN GPIO","type":"integer"},
         "ext_input_active_high":{"title":"EXT Input Active High","type":"boolean"},

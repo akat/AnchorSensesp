@@ -205,6 +205,7 @@ Access the configuration interface at `http://sensesp-anchor.local` (or device I
 | Chain Sensor GPIO | GPIO pin for reed switch | 25 | Configurable |
 | Enable Internal Pull-up | Use ESP32 internal pull-up | true | Usually keep enabled |
 | Meters per Pulse | Chain length per sensor pulse | 1.0 | Calibration value |
+| Pulse Debounce (ms) | Debounce time for chain sensor | 150 | 50-500ms, adjust for windlass speed |
 | **External Controls** | | | |
 | EXT UP GPIO | GPIO pin for external UP input | -1 | -1 to disable |
 | EXT DOWN GPIO | GPIO pin for external DOWN input | -1 | -1 to disable |

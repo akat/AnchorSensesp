@@ -19,10 +19,11 @@ This controller integrates with your boat's Signal K network to provide remote c
 ### Chain Counter Features
 - **Automatic measurement** - Counts chain links in real-time
 - **Bidirectional counting** - Tracks chain deployment (DOWN) and retrieval (UP)
+- **Advanced debouncing** - 150ms debounce with state validation to prevent double-counting
+- **Manual adjustment** - Set counter to any value via Signal K
 - **Calibration support** - Adjustable meters per pulse for different chain types
-- **Debounce protection** - Filters false triggers from sensor bounce
 - **Persistent storage** - Remembers chain length after power loss
-- **Reset capability** - Manual reset when anchor is fully retrieved
+- **Multiple reset options** - Reset to zero or set to specific value
 
 ### Safety Features
 - **Neutral delay** - Mandatory pause when reversing direction to prevent mechanical damage
@@ -53,6 +54,7 @@ This controller integrates with your boat's Signal K network to provide remote c
 - Mount near chain gypsy/windlass
 - Attach small magnet to chain or install on moving parts
 - Typical configuration: Reed switch triggers once per chain link (≈1 meter)
+- **Optional**: Add 100nF capacitor across switch terminals for hardware debouncing
 
 ### Windlass Motor
 - DC motor with UP and DOWN wiring
@@ -75,6 +77,7 @@ This controller integrates with your boat's Signal K network to provide remote c
 │             │
 │  GPIO 25 ───┼──→ Reed Switch ─────→ GND
 │             │     (with internal pull-up)
+│             │     Optional: 100nF capacitor parallel
 │             │
 │  GND ───────┼──→ Common Ground ←── Motor Ground
 │             │
@@ -95,6 +98,12 @@ Chain Counter Setup:
 │     │                      │
 │     └──→ GPIO 25           │
 └────────────────────────────┘
+
+Optional Hardware Debounce:
+Reed Switch
+    ├──→ GPIO 25
+    ├──→ 100nF capacitor
+    └──→ GND
 ```
 
 ### Default GPIO Pins
@@ -125,6 +134,7 @@ Chain Counter Setup:
    - One wire to GPIO 25
    - Other wire to GND
    - Internal pull-up is enabled in software
+   - Optional: Add 100nF capacitor for hardware debouncing
 5. **Test sensor**: Watch serial output while manually turning windlass
 
 ### 2. Software Installation
@@ -213,13 +223,16 @@ Send commands by setting these Signal K values:
 
 | Path | Value | Action |
 |------|-------|--------|
+| **Motor Control** | | |
 | `sensors.akat.anchor.state` | `"running_up"` | Raise anchor (runs until stopped) |
 | `sensors.akat.anchor.state` | `"running_down"` | Lower anchor (runs until stopped) |
 | `sensors.akat.anchor.state` | `"freefall"` | Quick drop for configured seconds |
 | `sensors.akat.anchor.state` | `"idle"` | Stop motor immediately |
 | `sensors.akat.anchor.state` | `"reset_counter"` | Reset chain counter to zero |
 | `sensors.akat.anchor.defaultChainSeconds` | number | Update default freefall duration |
-| `sensors.akat.anchor.resetChainCounter` | boolean | Reset counter (send `true`) |
+| **Chain Counter Control** | | |
+| `sensors.akat.anchor.chainOutSet` | number | **Set counter to specific value (meters)** |
+| `sensors.akat.anchor.resetChainCounter` | boolean | Reset counter to zero (send `true`) |
 
 ### Example: Signal K Deltas
 
@@ -236,7 +249,20 @@ Send commands by setting these Signal K values:
 }
 ```
 
-**Reset chain counter:**
+**Set chain counter to 25 meters:**
+```json
+{
+  "context": "vessels.self",
+  "updates": [{
+    "values": [{
+      "path": "sensors.akat.anchor.chainOutSet",
+      "value": 25.0
+    }]
+  }]
+}
+```
+
+**Reset chain counter to zero:**
 ```json
 {
   "context": "vessels.self",
@@ -280,17 +306,77 @@ Send commands by setting these Signal K values:
 - **View in Signal K apps** - data shown like any other sensor
 - **Example display**: "Anchor Chain: 23.5m deployed"
 
-### Resetting Chain Counter
+### Managing Chain Counter
+
+#### Resetting to Zero
 **When to reset:**
 - When anchor is fully retrieved (all chain on windlass)
 - After manual chain adjustment
 - When starting fresh measurement
 
-**How to reset:**
-1. Ensure anchor is fully retrieved
-2. Send reset command via Signal K
-3. Counter resets to 0.0 meters
-4. New measurements start from zero
+**How to reset (3 methods):**
+
+1. **Via Signal K Boolean** (recommended):
+   ```json
+   {"path": "sensors.akat.anchor.resetChainCounter", "value": true}
+   ```
+
+2. **Via State Command**:
+   ```json
+   {"path": "sensors.akat.anchor.state", "value": "reset_counter"}
+   ```
+
+3. **Via Web Interface**: Use Signal K apps with button controls
+
+#### Setting to Specific Value
+**When to use:**
+- You know exactly how much chain is deployed
+- Correcting drift/measurement errors
+- Synchronizing with manual measurement
+- Starting with chain already deployed
+
+**How to set:**
+```json
+{
+  "path": "sensors.akat.anchor.chainOutSet",
+  "value": 30.0  // Set to 30 meters
+}
+```
+
+**What happens:**
+1. Counter immediately updates to specified value
+2. Value is saved to flash memory
+3. Confirmation sent back to Signal K
+4. Counter continues from new value
+
+**Example scenarios:**
+
+**Scenario 1: Correcting measurement error**
+```
+Reality: 20m chain deployed
+Counter shows: 18.5m (missed some pulses)
+
+Solution: Send chainOutSet = 20.0
+Result: Counter now accurate at 20.0m
+```
+
+**Scenario 2: Starting with chain already out**
+```
+Situation: 30m chain deployed before powering on system
+Counter shows: 0.0m
+
+Solution: Send chainOutSet = 30.0
+Result: Counter tracks correctly from 30m
+```
+
+**Scenario 3: Manual retrieval**
+```
+Situation: Pulled anchor by hand, chain is at 0m
+Counter still shows: 15.0m
+
+Solution: Send resetChainCounter = true
+Result: Counter resets to 0.0m
+```
 
 ### Extending Runtime
 - Send the same direction command again while running
@@ -316,13 +402,36 @@ Send commands by setting these Signal K values:
 ### How It Works
 
 1. **Sensor triggers** when magnet passes (LOW signal)
-2. **Sensor releases** when magnet moves away (HIGH signal)
-3. **LOW→HIGH transition** counted as one pulse
-4. **Direction matters**:
+2. **State validation** - waits 150ms for stable state
+3. **Double-check** - ignores pulses within 300ms
+4. **LOW→HIGH transition** counted as one pulse
+5. **Direction matters**:
    - `RUNNING_DOWN`: Adds to chain_out_meters
    - `RUNNING_UP`: Subtracts from chain_out_meters
-5. **Debouncing** filters pulses closer than 50ms
-6. **Updates sent** to Signal K immediately
+6. **Advanced debouncing** filters false triggers
+7. **Updates sent** to Signal K immediately
+
+### Advanced Debouncing Algorithm
+
+The controller uses a sophisticated debouncing system:
+
+```cpp
+// State machine tracking:
+- last_sensor_state: Current reading
+- sensor_stable_state: Confirmed stable state
+- sensor_stable_since: When stability began
+
+// Debounce process:
+1. Detect state change
+2. Wait 150ms for stability
+3. Confirm state hasn't changed
+4. Check 300ms minimum between pulses
+5. Count only if all checks pass
+```
+
+**Why this matters:**
+- ❌ Simple debounce (50ms): Counts 2-3 times per pulse
+- ✅ Advanced debounce (150ms + validation): Accurate single count
 
 ### Sensor Placement Tips
 
@@ -331,14 +440,32 @@ Send commands by setting these Signal K values:
 - ✅ Switch mounted securely, won't vibrate loose
 - ✅ Protected from water spray
 - ✅ One trigger per chain link/meter
+- ✅ Magnet attached firmly (use epoxy or cable ties)
 
 **Avoid:**
 - ❌ Magnet too far (>15mm) - unreliable triggering
 - ❌ Multiple magnets in range - double counting
 - ❌ Loose mounting - missed counts
 - ❌ Direct water exposure - use waterproof reed switch
+- ❌ Fast magnet passes - can cause bounce
 
 ### Troubleshooting Chain Counter
+
+**Counter incrementing multiple times (+2, +3):**
+1. **Bouncing issue** - most common cause
+   - Check logs for "pulse ignored (too soon)" messages
+   - If you see many, hardware is bouncing
+   - Solution: Add 100nF capacitor across switch
+2. **Magnet too strong/close**
+   - Switch stays triggered too long
+   - Solution: Move magnet slightly farther away
+3. **Vibration triggering**
+   - Boat vibration causing false triggers
+   - Solution: Mount switch more securely
+4. **Increase debounce time** (if needed):
+   ```cpp
+   const unsigned long pulse_debounce_ms = 200; // or 250ms
+   ```
 
 **Counter not incrementing:**
 1. Check wiring: GPIO 25 to one terminal, GND to other
@@ -346,20 +473,22 @@ Send commands by setting these Signal K values:
 3. Check logs: Should see "Chain OUT" or "Chain IN" messages
 4. Test sensor: Use multimeter in continuity mode
 
-**Counter incrementing too fast:**
-1. Check for multiple magnets in range
-2. Verify debounce is working (50ms minimum between pulses)
-3. Reduce sensor sensitivity if adjustable
-
 **Counter incrementing in wrong direction:**
 1. Verify motor direction matches state (UP should raise, DOWN should lower)
 2. Check relay wiring
 3. Swap relay connections if motor runs backwards
 
 **Counter drifts over time:**
-1. Recalibrate: Measure known length and adjust calibration factor
-2. Check for loose magnet (might miss some triggers)
-3. Verify sensor isn't triggering from vibration
+1. Use `chainOutSet` to correct periodically
+2. Recalibrate: Measure known length and adjust calibration factor
+3. Check for loose magnet (might miss some triggers)
+4. Verify sensor isn't triggering from vibration
+
+**Counter resets unexpectedly:**
+1. Check power supply stability
+2. Verify flash storage is working (logs will show save errors)
+3. Don't send reset commands accidentally
+4. Check Signal K for unexpected `chainOutSet` values
 
 ## Safety Features Explained
 
@@ -406,7 +535,18 @@ Send commands by setting these Signal K values:
 
 **Without this**: Signal K restart would flood ESP32 with cached commands, causing freeze.
 
-### 4. Reconnection Handling
+### 4. Chain Counter Debouncing (150ms + validation)
+**Why it exists**: Prevents double/triple counting from switch bounce.
+
+**How it works**:
+- Waits 150ms for sensor state to stabilize
+- Validates state hasn't changed during wait
+- Requires minimum 300ms between pulses
+- Logs "too soon" warnings for debugging
+
+**Without this**: One magnet pass could count 2-3 times.
+
+### 5. Reconnection Handling
 **Why it exists**: Automatic recovery from network issues.
 
 **How it works**:
@@ -414,109 +554,26 @@ Send commands by setting these Signal K values:
 - If disconnected > 60 seconds → attempts reconnect
 - After 8 failed attempts → ESP32 reboot (full reset)
 
-## Troubleshooting
-
-### Motor Won't Start
-1. **Check Signal K connection**
-   - LED should not be blinking if idle
-   - Check logs: `sensors.akat.anchor.lastUpdate` should be recent
-   
-2. **Check enabled status**
-   - Verify `enabled = true` in configuration
-   - Send command with enabled check: see `sensors.akat.anchor.enabled`
-
-3. **Check relay wiring**
-   - Verify GPIO pins in configuration match physical wiring
-   - Test relay trigger logic (active HIGH vs LOW)
-   - Use multimeter to verify relay switching
-
-4. **Check command debouncing**
-   - Wait 2 seconds after connection before sending commands
-   - Avoid rapid repeated commands
-
-### Motor Won't Stop
-1. **Send idle command**
-   ```json
-   {"path": "sensors.akat.anchor.state", "value": "idle"}
-   ```
-
-2. **Disconnect Signal K** - Motor will stop automatically (safety feature)
-
-3. **Power cycle ESP32** - Last resort
-
-### Chain Counter Issues
-
-**Not counting:**
-1. Check sensor wiring (GPIO 25 and GND)
-2. Verify magnet passes close enough (<10mm)
-3. Enable debug logging to see sensor state changes
-4. Test sensor with multimeter (should show open/closed)
-
-**Counting backwards:**
-1. Verify motor direction (check relay connections)
-2. Ensure UP command raises anchor, DOWN lowers it
-
-**Inaccurate count:**
-1. Recalibrate using known chain length
-2. Check for missed triggers (magnet too far)
-3. Verify debounce isn't filtering valid pulses
-
-**Counter resets unexpectedly:**
-1. Check power supply stability
-2. Verify flash storage is working (logs will show save errors)
-3. Don't send reset commands accidentally
-
-### Connection Issues
-1. **Check WiFi signal strength**
-   - Logs show RSSI every 60 seconds
-   - Relocate ESP32 if signal weak
-
-2. **Check Signal K server**
-   - Verify server running and accessible
-   - Check server logs for connection attempts
-
-3. **Check logs**
-   ```
-   SK WS: Connected          ← Good
-   SK WS: Disconnected       ← Check network
-   WiFi disconnected         ← WiFi problem
-   Chain OUT: 15.5m          ← Counter working
-   ```
-
-### ESP32 Keeps Rebooting
-1. **Check power supply** - Needs stable 5V, 500mA minimum
-2. **Check relay current draw** - May need separate relay power
-3. **Check logs before reboot** - Look for watchdog triggers
-
-### Motor Stops Unexpectedly
-1. **Connection loss** - Check for WiFi/network stability
-2. **Timeout reached** - Motor runs for 1 hour default, then stops
-3. **Check logs** for reason:
-   ```
-   up:done              ← Completed normally
-   safety:disconnected  ← Connection lost
-   idle:remote          ← Stopped by command
-   ```
-
 ## Technical Specifications
 
 ### Timing Parameters
 - **Command debounce**: 250ms
 - **Neutral delay**: 400ms (configurable)
-- **Chain sensor debounce**: 50ms
+- **Chain sensor debounce**: 150ms (state validation)
+- **Minimum pulse interval**: 300ms (double-check)
 - **Connection settling**: 2000ms after reconnect
 - **Heartbeat interval**: 2000ms
 - **Reconnect timeout**: 60000ms
 - **Default runtime**: 3600s (1 hour)
 
 ### Memory Usage
-- **Flash**: ~1MB (program + libraries)
-- **RAM**: ~50KB typical usage
+- **Flash**: ~1.1MB (program + libraries)
+- **RAM**: ~55KB typical usage
 - **Persistent storage**: <2KB (configuration + chain count)
 
 ### Network Performance
-- **WebSocket messages**: ~200-300 bytes per heartbeat
-- **Bandwidth**: <150 bytes/sec average
+- **WebSocket messages**: ~250-350 bytes per heartbeat
+- **Bandwidth**: <200 bytes/sec average
 - **Latency**: <50ms command response (local network)
 
 ### GPIO Requirements
@@ -528,41 +585,11 @@ Send commands by setting these Signal K values:
 ### Chain Counter Specifications
 - **Sensor type**: Reed switch (normally open)
 - **Trigger distance**: 5-15mm typical
-- **Debounce time**: 50ms
+- **Debounce time**: 150ms + 300ms double-check
 - **Resolution**: Configurable (typically 1.0m per pulse)
 - **Range**: 0-9999.9 meters (practical limit)
-- **Accuracy**: ±1 pulse (depends on calibration)
-
-## Use Cases & Examples
-
-### Scenario 1: Anchoring in 20m Depth
-```
-1. Position boat over anchorage
-2. Send: "running_down" command
-3. Watch Signal K display: chainOut increases
-4. At 20m deployed: Send "idle" command
-5. Set anchor, verify holding
-6. Note: "23m deployed" (20m depth + 3m scope)
-```
-
-### Scenario 2: Retrieving Anchor
-```
-1. Motor up slowly: Send "running_up"
-2. Watch chain counter decrease: 23m → 20m → 15m...
-3. At 0m: Anchor at bow roller
-4. Send "idle" command
-5. Chain counter shows 0.0m (or close to it)
-6. Send "reset_counter" to zero any drift
-```
-
-### Scenario 3: Let Out More Scope
-```
-Current: 25m deployed, need 35m
-1. Send "running_down"
-2. Watch: 25m → 30m → 35m
-3. Send "idle"
-Result: 35m deployed, 10m added
-```
+- **Accuracy**: ±1 pulse (depends on calibration and setup)
+- **Set range**: 0-9999.9 meters via `chainOutSet`
 
 ## Integration Examples
 
@@ -573,6 +600,30 @@ msg.payload = {
     "context": "vessels.self",
     "subscribe": [{
         "path": "sensors.akat.anchor.chainOut"
+    }]
+};
+return msg;
+
+// Set chain counter to specific value
+msg.payload = {
+    "context": "vessels.self",
+    "updates": [{
+        "values": [{
+            "path": "sensors.akat.anchor.chainOutSet",
+            "value": 25.0
+        }]
+    }]
+};
+return msg;
+
+// Reset chain counter
+msg.payload = {
+    "context": "vessels.self",
+    "updates": [{
+        "values": [{
+            "path": "sensors.akat.anchor.resetChainCounter",
+            "value": true
+        }]
     }]
 };
 return msg;
@@ -590,6 +641,7 @@ return msg;
 2. Configure path: `sensors.akat.anchor.chainOut`
 3. Set units: meters
 4. Display shows real-time chain length
+5. Add buttons for `chainOutSet` and `resetChainCounter`
 
 ### Grafana Dashboard
 ```sql
@@ -636,8 +688,10 @@ Watch for these log messages:
 ```
 Chain counter initialized: pin=25, pullup=1, cal=1.00m/pulse
 Chain OUT: 1.0m (pulse #1)
+Chain pulse ignored (too soon: 45ms)  ← Bouncing detected!
 Chain OUT: 2.0m (pulse #2)
 Chain IN: 1.0m (pulse #1)
+Chain counter SET to 25.0m (25 pulses) via SignalK
 Chain counter reset to 0
 ```
 
@@ -669,7 +723,15 @@ For issues, questions, or contributions, please refer to the project repository.
 
 ## Changelog
 
-### Version 2.0 (Current)
+### Version 2.1 (Current)
+- ✨ Added `chainOutSet` path - set counter to any value
+- 🔧 Improved debouncing algorithm (150ms + validation)
+- 🔧 Added double-check for pulses (300ms minimum)
+- 📝 Enhanced logging with "too soon" warnings
+- 🐛 Fixed double/triple counting issue
+- 📊 Counter value now saved after manual set
+
+### Version 2.0
 - ✨ Added chain counter with magnetic reed switch
 - ✨ Real-time chain length measurement
 - ✨ Persistent chain count storage
@@ -696,5 +758,15 @@ For issues, questions, or contributions, please refer to the project repository.
 - Keep clear of moving chain and anchor while operating
 - Verify chain counter accuracy regularly
 - Use chain counter as reference only, not primary safety measurement
+- Manually verify chain length periodically
+- Account for chain stretch and measurement drift over time
 
-**Last Updated**: 2025-10-29
+**⚠️ Chain Counter Disclaimer**: The chain counter is a convenience feature and should not be relied upon as the sole means of determining anchor rode length. Always:
+- Visually verify chain deployment when possible
+- Use depth sounder to confirm water depth
+- Account for scope requirements (chain length to depth ratio)
+- Mark your chain physically with paint or markers
+- Periodically verify counter accuracy against physical markers
+- Recalibrate after maintenance or chain replacement
+
+**Last Updated**: 2025-10-30

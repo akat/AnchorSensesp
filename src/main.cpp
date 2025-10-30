@@ -529,7 +529,7 @@ void setup() {
   SetupLogging();
   SensESPAppBuilder builder;
   builder.set_hostname("sensesp-anchor");
-  builder.set_wifi_access_point("SensESP-anchor", "948171");
+  builder.set_wifi_access_point("SensESP-anchor", "948171!!");
   ::sensesp::sensesp_app = builder.get_app();
   configTime(0, 0, "pool.ntp.org");
   anchor = std::make_shared<AnchorController>(); anchor->load();

@@ -43,7 +43,9 @@ class AnchorController : public FileSystemSaveable {
   int   chain_pulse_count  = 0;        // Μετρητής παλμών
   bool  last_sensor_state  = HIGH;     // Προηγούμενη κατάσταση αισθητήρα
   unsigned long last_pulse_ms = 0;     // Τελευταίος παλμός (για debounce)
-  const unsigned long pulse_debounce_ms = 50; // Debounce 50ms
+  unsigned long sensor_stable_since = 0; // Πότε σταθεροποιήθηκε η κατάσταση
+  bool  sensor_stable_state = HIGH;    // Σταθερή κατάσταση μετά debounce
+  const unsigned long pulse_debounce_ms = 150; // Debounce 150ms (αυξημένο)
 
   // Runtime state
   enum RunState { IDLE, RUNNING_UP, RUNNING_DOWN, FAULT };
@@ -86,6 +88,8 @@ class AnchorController : public FileSystemSaveable {
       pinMode(chain_sensor_pin, INPUT);
     }
     last_sensor_state = digitalRead(chain_sensor_pin);
+    sensor_stable_since = millis();
+    sensor_stable_state = last_sensor_state;
     
     ESP_LOGI(TAG, "Chain counter initialized: pin=%d, pullup=%d, cal=%.2fm/pulse", 
              chain_sensor_pin, chain_sensor_pullup, chain_calibration);
@@ -115,10 +119,33 @@ class AnchorController : public FileSystemSaveable {
     bool current_state = digitalRead(chain_sensor_pin);
     unsigned long now_ms = millis();
     
-    // Ανίχνευση μετάβασης LOW→HIGH (όταν η μαγνητική επαφή ανοίξει)
-    if (current_state == HIGH && last_sensor_state == LOW) {
-      // Debounce: αγνόησε παλμούς που είναι πολύ κοντά
-      if (now_ms - last_pulse_ms > pulse_debounce_ms) {
+    // Βελτιωμένο debouncing: ο αισθητήρας πρέπει να είναι σταθερός για 150ms
+    if (current_state != last_sensor_state) {
+      // Η κατάσταση άλλαξε - ξεκίνα μέτρηση σταθερότητας
+      last_sensor_state = current_state;
+      sensor_stable_since = now_ms;
+      return; // Περίμενε να σταθεροποιηθεί
+    }
+    
+    // Έλεγξε αν η κατάσταση είναι σταθερή για αρκετό χρόνο
+    if (now_ms - sensor_stable_since < pulse_debounce_ms) {
+      return; // Ακόμα περιμένουμε σταθεροποίηση
+    }
+    
+    // Η κατάσταση είναι σταθερή - έλεγξε για μετάβαση
+    if (current_state != sensor_stable_state) {
+      // Η σταθερή κατάσταση άλλαξε (μετά από debounce)
+      bool old_stable = sensor_stable_state;
+      sensor_stable_state = current_state;
+      
+      // Μέτρησε μόνο στην ανοδική ακμή (LOW→HIGH)
+      if (old_stable == LOW && sensor_stable_state == HIGH) {
+        // Πρόσθετος έλεγχος: αγνόησε παλμούς πολύ κοντά χρονικά
+        if (now_ms - last_pulse_ms < pulse_debounce_ms * 2) {
+          ESP_LOGW(TAG, "Chain pulse ignored (too soon: %lums)", now_ms - last_pulse_ms);
+          return;
+        }
+        
         last_pulse_ms = now_ms;
         
         // Μέτρησε ανάλογα με την κατεύθυνση
@@ -130,7 +157,7 @@ class AnchorController : public FileSystemSaveable {
         } else if (state == RUNNING_UP) {
           // Ανέβασμα αγκύρας → μείωση μέτρων
           chain_out_meters -= chain_calibration;
-          if (chain_out_meters < 0.0f) chain_out_meters = 0.0f; // Δεν πάει αρνητικό
+          if (chain_out_meters < 0.0f) chain_out_meters = 0.0f;
           chain_pulse_count--;
           if (chain_pulse_count < 0) chain_pulse_count = 0;
           ESP_LOGI(TAG, "Chain IN: %.1fm (pulse #%d)", chain_out_meters, chain_pulse_count);
@@ -140,8 +167,6 @@ class AnchorController : public FileSystemSaveable {
         sendChainUpdate_();
       }
     }
-    
-    last_sensor_state = current_state;
   }
   
   void resetChainCounter() {
@@ -521,7 +546,30 @@ class AnchorController : public FileSystemSaveable {
       default_chain_seconds = v;
     }));
     
-    // Chain counter reset listener
+    // Chain counter SET listener - ακούει για νέα τιμή μέτρων
+    auto chain_set_listener = new FloatSKListener("sensors.akat.anchor.chainOutSet", 500);
+    chain_set_listener->connect_to(new LambdaConsumer<float>([this](float meters) {
+      extern SKWSConnectionState g_ws_state;
+      if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
+      
+      // Ενημέρωσε τον μετρητή με τη νέα τιμή
+      chain_out_meters = meters;
+      if (chain_out_meters < 0.0f) chain_out_meters = 0.0f;
+      
+      // Υπολόγισε τους παλμούς από τα μέτρα
+      chain_pulse_count = (int)(chain_out_meters / chain_calibration);
+      
+      ESP_LOGI(TAG, "Chain counter SET to %.1fm (%d pulses) via SignalK", 
+               chain_out_meters, chain_pulse_count);
+      
+      // Αποθήκευσε την νέα τιμή
+      save();
+      
+      // Στείλε επιβεβαίωση πίσω στο Signal K
+      sendChainUpdate_();
+    }));
+    
+    // Chain counter RESET listener (boolean) - για reset στο 0
     auto chain_reset_listener = new BoolSKListener("sensors.akat.anchor.resetChainCounter", 500);
     chain_reset_listener->connect_to(new LambdaConsumer<bool>([this](bool reset) {
       extern SKWSConnectionState g_ws_state;

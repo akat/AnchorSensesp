@@ -32,6 +32,16 @@ This controller integrates with your boat's Signal K network to provide remote c
 - **Re-entrancy protection** - Prevents conflicting simultaneous commands
 - **Visual feedback** - Onboard LED blinks when motor is running
 
+### External Control
+- **GPIO inputs** - Optional external buttons/switches for UP/DOWN control
+- **Debounced inputs** - Configurable debounce time for external controls
+- **Conflict detection** - Prevents simultaneous UP/DOWN activation
+
+### Virtual Buzzer Alerts
+- **Threshold-based alerts** - Configurable chain length thresholds
+- **Directional alerts** - Alerts on deployment, retrieval, or both
+- **Signal K events** - Publishes alert events with beep counts and timestamps
+
 ### Network Protection
 - **Connection settling period** - Ignores cached values for 2 seconds after reconnection
 - **Reconnection handling** - Automatic reconnection with watchdog timer
@@ -66,6 +76,10 @@ This controller integrates with your boat's Signal K network to provide remote c
 - Separate power supply for windlass motor (12V/24V typical)
 - **Important**: ESP32 and motor should share common ground
 
+### Optional External Controls
+- Push buttons or switches for UP/DOWN
+- Configurable GPIO pins and active level
+
 ## Wiring Diagram
 
 ```
@@ -79,14 +93,17 @@ This controller integrates with your boat's Signal K network to provide remote c
 │             │     (with internal pull-up)
 │             │     Optional: 100nF capacitor parallel
 │             │
+│  GPIO 12 ───┼──→ EXT UP Button (optional)
+│  GPIO 13 ───┼──→ EXT DOWN Button (optional)
+│             │
 │  GND ───────┼──→ Common Ground ←── Motor Ground
 │             │
 │  5V ────────┼──→ ESP32 Power
 └─────────────┘
 
 Motor Power Supply (12V/24V)
-     │
-     └──→ Relay COM terminals
+      │
+      └──→ Relay COM terminals
 
 Chain Counter Setup:
 ┌────────────────────────────┐
@@ -110,6 +127,8 @@ Reed Switch
 - **Relay UP**: GPIO 26
 - **Relay DOWN**: GPIO 27
 - **Chain Sensor**: GPIO 25 (with internal pull-up)
+- **EXT UP**: GPIO 12 (optional)
+- **EXT DOWN**: GPIO 13 (optional)
 - **LED indicator**: Built-in LED (GPIO 2 on most boards)
 
 *Note: All pins are configurable through the web interface*
@@ -136,6 +155,11 @@ Reed Switch
    - Internal pull-up is enabled in software
    - Optional: Add 100nF capacitor for hardware debouncing
 5. **Test sensor**: Watch serial output while manually turning windlass
+
+#### Optional External Controls
+1. Connect push buttons to configured GPIO pins
+2. Configure active level (HIGH/LOW) in web interface
+3. Set debounce time appropriately
 
 ### 2. Software Installation
 
@@ -181,6 +205,17 @@ Access the configuration interface at `http://sensesp-anchor.local` (or device I
 | Chain Sensor GPIO | GPIO pin for reed switch | 25 | Configurable |
 | Enable Internal Pull-up | Use ESP32 internal pull-up | true | Usually keep enabled |
 | Meters per Pulse | Chain length per sensor pulse | 1.0 | Calibration value |
+| **External Controls** | | | |
+| EXT UP GPIO | GPIO pin for external UP input | -1 | -1 to disable |
+| EXT DOWN GPIO | GPIO pin for external DOWN input | -1 | -1 to disable |
+| EXT Input Active High | External input trigger logic | true | Set false for active-low |
+| EXT Input Debounce (ms) | Debounce time for external inputs | 50 | 10-250ms |
+| **Virtual Buzzer** | | | |
+| Base Threshold (m) | Starting chain length for alerts | 20.0 | In meters |
+| Step (m) | Chain length increment for additional beeps | 10.0 | In meters |
+| Base Beeps | Number of beeps at base threshold | 1 | 1-10 |
+| Beeps/Step | Additional beeps per step | 1 | 1-5 |
+| Beep On Direction | When to trigger alerts | "DOWN" | "UP", "DOWN", or "BOTH" |
 
 ### 4. Chain Counter Calibration
 
@@ -216,6 +251,13 @@ The controller publishes to Signal K:
 | `sensors.akat.anchor.lastCommand` | string | Current operation | While running |
 | `sensors.akat.anchor.chainOut` | number | Meters of chain deployed | Real-time + heartbeat |
 | `sensors.akat.anchor.chainPulses` | number | Raw pulse count (debug) | On change |
+| `sensors.akat.anchor.state` | string | Current state ("idle", "running_up", "running_down", "fault") | Real-time + heartbeat |
+| `sensors.akat.anchor.externalControl.active` | boolean | External control active status | On change |
+| `sensors.akat.anchor.externalControl.source` | string | External control source ("NONE", "UP", "DOWN") | On change |
+| `sensors.akat.anchor.alert.buzzerEvent` | string | JSON alert event with beeps and threshold | On alert |
+| `sensors.akat.anchor.alert.lastThreshold` | number | Last alert threshold (meters) | On alert |
+| `sensors.akat.anchor.alert.lastBeeps` | number | Last alert beep count | On alert |
+| `sensors.akat.anchor.alert.firedAt` | string | Last alert timestamp | On alert |
 
 ### Subscribed Paths (Commands)
 
@@ -224,12 +266,11 @@ Send commands by setting these Signal K values:
 | Path | Value | Action |
 |------|-------|--------|
 | **Motor Control** | | |
-| `sensors.akat.anchor.state` | `"running_up"` | Raise anchor (runs until stopped) |
-| `sensors.akat.anchor.state` | `"running_down"` | Lower anchor (runs until stopped) |
-| `sensors.akat.anchor.state` | `"freefall"` | Quick drop for configured seconds |
-| `sensors.akat.anchor.state` | `"idle"` | Stop motor immediately |
-| `sensors.akat.anchor.state` | `"reset_counter"` | Reset chain counter to zero |
-| `sensors.akat.anchor.defaultChainSeconds` | number | Update default freefall duration |
+| `sensors.akat.anchor.command` | `"running_up"` | Raise anchor (runs until stopped) |
+| `sensors.akat.anchor.command` | `"running_down"` | Lower anchor (runs until stopped) |
+| `sensors.akat.anchor.command` | `"freefall"` | Quick drop for configured seconds |
+| `sensors.akat.anchor.command` | `"idle"` | Stop motor immediately |
+| `sensors.akat.anchor.command` | `"reset_counter"` | Reset chain counter to zero |
 | **Chain Counter Control** | | |
 | `sensors.akat.anchor.chainOutSet` | number | **Set counter to specific value (meters)** |
 | `sensors.akat.anchor.resetChainCounter` | boolean | Reset counter to zero (send `true`) |
@@ -242,7 +283,7 @@ Send commands by setting these Signal K values:
   "context": "vessels.self",
   "updates": [{
     "values": [{
-      "path": "sensors.akat.anchor.state",
+      "path": "sensors.akat.anchor.command",
       "value": "running_up"
     }]
   }]
@@ -314,19 +355,17 @@ Send commands by setting these Signal K values:
 - After manual chain adjustment
 - When starting fresh measurement
 
-**How to reset (3 methods):**
+**How to reset (2 methods):**
 
-1. **Via Signal K Boolean** (recommended):
+1. **Via State Command**:
+   ```json
+   {"path": "sensors.akat.anchor.command", "value": "reset_counter"}
+   ```
+
+2. **Via Boolean**:
    ```json
    {"path": "sensors.akat.anchor.resetChainCounter", "value": true}
    ```
-
-2. **Via State Command**:
-   ```json
-   {"path": "sensors.akat.anchor.state", "value": "reset_counter"}
-   ```
-
-3. **Via Web Interface**: Use Signal K apps with button controls
 
 #### Setting to Specific Value
 **When to use:**
@@ -349,35 +388,6 @@ Send commands by setting these Signal K values:
 3. Confirmation sent back to Signal K
 4. Counter continues from new value
 
-**Example scenarios:**
-
-**Scenario 1: Correcting measurement error**
-```
-Reality: 20m chain deployed
-Counter shows: 18.5m (missed some pulses)
-
-Solution: Send chainOutSet = 20.0
-Result: Counter now accurate at 20.0m
-```
-
-**Scenario 2: Starting with chain already out**
-```
-Situation: 30m chain deployed before powering on system
-Counter shows: 0.0m
-
-Solution: Send chainOutSet = 30.0
-Result: Counter tracks correctly from 30m
-```
-
-**Scenario 3: Manual retrieval**
-```
-Situation: Pulled anchor by hand, chain is at 0m
-Counter still shows: 15.0m
-
-Solution: Send resetChainCounter = true
-Result: Counter resets to 0.0m
-```
-
 ### Extending Runtime
 - Send the same direction command again while running
 - Time is extended without stopping motor
@@ -396,6 +406,17 @@ Result: Counter resets to 0.0m
 - Stops automatically after configured time
 - Chain counter tracks deployment
 - Useful for quick chain deployment
+
+### External Control
+- Connect buttons to configured GPIO pins
+- Buttons override Signal K commands when pressed
+- Automatic conflict detection prevents simultaneous UP/DOWN
+
+### Virtual Buzzer Alerts
+- Alerts trigger when chain crosses configured thresholds
+- Beep count increases with chain length
+- Events published to Signal K for external handling
+- Configurable for deployment, retrieval, or both directions
 
 ## Chain Counter Details
 
@@ -424,7 +445,7 @@ The controller uses a sophisticated debouncing system:
 // Debounce process:
 1. Detect state change
 2. Wait 150ms for stability
-3. Confirm state hasn't changed
+3. Confirm state hasn't changed during wait
 4. Check 300ms minimum between pulses
 5. Count only if all checks pass
 ```
@@ -470,7 +491,7 @@ The controller uses a sophisticated debouncing system:
 **Counter not incrementing:**
 1. Check wiring: GPIO 25 to one terminal, GND to other
 2. Verify magnet proximity: Should be <10mm at closest point
-3. Check logs: Should see "Chain OUT" or "Chain IN" messages
+3. Check logs: Should see chain updates
 4. Test sensor: Use multimeter in continuity mode
 
 **Counter incrementing in wrong direction:**
@@ -546,7 +567,15 @@ The controller uses a sophisticated debouncing system:
 
 **Without this**: One magnet pass could count 2-3 times.
 
-### 5. Reconnection Handling
+### 5. External Input Debouncing (50ms configurable)
+**Why it exists**: Prevents false triggers from button bounce.
+
+**How it works**:
+- Debounces external GPIO inputs
+- Configurable time (10-250ms)
+- Filters out noise and contact bounce
+
+### 6. Reconnection Handling
 **Why it exists**: Automatic recovery from network issues.
 
 **How it works**:
@@ -565,6 +594,7 @@ The controller uses a sophisticated debouncing system:
 - **Heartbeat interval**: 2000ms
 - **Reconnect timeout**: 60000ms
 - **Default runtime**: 3600s (1 hour)
+- **External input debounce**: 50ms (configurable)
 
 ### Memory Usage
 - **Flash**: ~1.1MB (program + libraries)
@@ -579,6 +609,7 @@ The controller uses a sophisticated debouncing system:
 ### GPIO Requirements
 - **2 output pins** for relays (configurable)
 - **1 input pin** for chain sensor (configurable, with pull-up)
+- **2 optional input pins** for external controls (configurable)
 - **1 output pin** for LED (built-in)
 - All standard ESP32 GPIO pins supported
 
@@ -597,41 +628,41 @@ The controller uses a sophisticated debouncing system:
 ```javascript
 // Read chain length
 msg.payload = {
-    "context": "vessels.self",
-    "subscribe": [{
-        "path": "sensors.akat.anchor.chainOut"
-    }]
+  "context": "vessels.self",
+  "subscribe": [{
+    "path": "sensors.akat.anchor.chainOut"
+  }]
 };
 return msg;
 
 // Set chain counter to specific value
 msg.payload = {
-    "context": "vessels.self",
-    "updates": [{
-        "values": [{
-            "path": "sensors.akat.anchor.chainOutSet",
-            "value": 25.0
-        }]
+  "context": "vessels.self",
+  "updates": [{
+    "values": [{
+      "path": "sensors.akat.anchor.chainOutSet",
+      "value": 25.0
     }]
+  }]
 };
 return msg;
 
 // Reset chain counter
 msg.payload = {
-    "context": "vessels.self",
-    "updates": [{
-        "values": [{
-            "path": "sensors.akat.anchor.resetChainCounter",
-            "value": true
-        }]
+  "context": "vessels.self",
+  "updates": [{
+    "values": [{
+      "path": "sensors.akat.anchor.resetChainCounter",
+      "value": true
     }]
+  }]
 };
 return msg;
 
 // Display in dashboard
 if (msg.payload.updates) {
-    var chainOut = msg.payload.updates[0].values[0].value;
-    msg.payload = "Chain deployed: " + chainOut.toFixed(1) + "m";
+  var chainOut = msg.payload.updates[0].values[0].value;
+  msg.payload = "Chain deployed: " + chainOut.toFixed(1) + "m";
 }
 return msg;
 ```
@@ -646,7 +677,7 @@ return msg;
 ### Grafana Dashboard
 ```sql
 -- Query for chain deployment over time
-SELECT 
+SELECT
   time,
   value as "Chain Out (m)"
 FROM signalk
@@ -664,6 +695,8 @@ main.cpp
 │   ├── Chain counter (updateChainCounter, resetChainCounter)
 │   ├── State machine (runDirection, startRun, stopNow)
 │   ├── Signal K integration (sendHeartbeat, attachSignalK)
+│   ├── External inputs (handleExternalInputs_)
+│   ├── Virtual buzzer (checkBuzzerThresholds, fireBuzzer_)
 │   ├── Configuration (to_json, from_json, get_config_schema)
 │   └── Main loop (tick)
 ├── setup() - Initialization
@@ -725,6 +758,8 @@ For issues, questions, or contributions, please refer to the project repository.
 
 ### Version 2.1 (Current)
 - ✨ Added `chainOutSet` path - set counter to any value
+- ✨ Added external GPIO control inputs
+- ✨ Added virtual buzzer alerts with configurable thresholds
 - 🔧 Improved debouncing algorithm (150ms + validation)
 - 🔧 Added double-check for pulses (300ms minimum)
 - 📝 Enhanced logging with "too soon" warnings

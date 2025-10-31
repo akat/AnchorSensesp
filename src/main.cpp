@@ -180,8 +180,29 @@ class AnchorController : public FileSystemSaveable {
   void resetChainCounter() {
     chain_out_meters = 0.0f;
     chain_pulse_count = 0;
+
+    // Reset buzzer alert data
+    buzzer_last_alert_threshold = 0.0f;
+    buzzer_last_alert_beeps = 0;
+    buzzer_last_alert_time = "";
+
     ESP_LOGI(ANCHOR_TAG, "Chain counter RESET to 0");
     sendChainUpdate_();
+
+    // Send reset values for buzzer alerts
+    sendSkDeltaFloat_("sensors.akat.anchor.alert.lastThreshold", buzzer_last_alert_threshold);
+    sendSkDeltaInt_("sensors.akat.anchor.alert.lastBeeps", buzzer_last_alert_beeps);
+    sendSkDeltaString_("sensors.akat.anchor.alert.firedAt", buzzer_last_alert_time);
+
+    // Send empty buzzer event to clear any previous alerts
+    JsonDocument resetDoc;
+    JsonObject resetEv = resetDoc.to<JsonObject>();
+    resetEv["beeps"] = 0;
+    resetEv["threshold"] = 0.0f;
+    resetEv["time"] = "";
+    String resetPayload;
+    serializeJson(resetEv, resetPayload);
+    sendSkDeltaString_("sensors.akat.anchor.alert.buzzerEvent", resetPayload);
   }
   
   void sendChainUpdate_() {

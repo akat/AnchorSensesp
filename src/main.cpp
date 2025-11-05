@@ -58,6 +58,11 @@ class AnchorController : public FileSystemSaveable {
   unsigned long last_sk_update_ms_ = 0;
   unsigned long last_led_toggle_ms_ = 0;
   bool led_state_ = false;
+
+  unsigned long last_chain_update_sent_ms_ = 0;
+  const unsigned long chain_update_interval_ms_ = 500; // 500ms rate limit
+  bool chain_update_pending_ = false;
+
   bool relays_on_ = false;
   unsigned long last_command_ms_ = 0;
   const unsigned long command_debounce_ms_ = 250;
@@ -171,15 +176,33 @@ class AnchorController : public FileSystemSaveable {
                    external_control_active ? " [EXT]" : "");
         }
         
-        sendChainUpdate_();
+        chain_update_pending_ = true;
         checkBuzzerThresholds(prevChainOut, chain_out_meters, state == RUNNING_DOWN);
       }
     }
+  }
+
+  void sendPendingChainUpdate_() {
+      unsigned long now_ms = millis();
+      
+      if (chain_update_pending_ && 
+          (now_ms - last_chain_update_sent_ms_ >= chain_update_interval_ms_)) {
+          sendChainUpdate_();
+          last_chain_update_sent_ms_ = now_ms;
+          chain_update_pending_ = false;
+      }
   }
   
   void resetChainCounter() {
     chain_out_meters = 0.0f;
     chain_pulse_count = 0;
+
+    // Reset rate limiting
+    chain_update_pending_ = false;
+    last_chain_update_sent_ms_ = 0;
+
+    // Reset buzzer alert data
+    buzzer_last_alert_threshold = 0.0f;
 
     // Reset buzzer alert data
     buzzer_last_alert_threshold = 0.0f;
@@ -579,9 +602,9 @@ class AnchorController : public FileSystemSaveable {
     v2["path"] = "sensors.akat.anchor.lastUpdate";
     v2["value"] = isoTimestamp();
     
-    JsonObject v3 = values.add<JsonObject>();
-    v3["path"] = "sensors.akat.anchor.chainOut";
-    v3["value"] = chain_out_meters;
+    // JsonObject v3 = values.add<JsonObject>();
+    // v3["path"] = "sensors.akat.anchor.chainOut";
+    // v3["value"] = chain_out_meters;
     
     JsonObject v4 = values.add<JsonObject>();
     v4["path"] = "sensors.akat.anchor.state";
@@ -678,6 +701,9 @@ class AnchorController : public FileSystemSaveable {
     
     // Update chain counter
     updateChainCounter();
+
+    // ΠΡΟΣΘΗΚΗ: Στείλε pending chain updates με rate limiting
+    sendPendingChainUpdate_();
     
     // Handle neutral wait queue
     if (neutral_waiting && now_ms >= neutral_until_ms) {

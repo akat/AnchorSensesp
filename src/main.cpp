@@ -14,7 +14,14 @@ using namespace sensesp;
 
 // ----------- Helpers -----------
 static String isoTimestamp() {
-  time_t now; time(&now);
+  time_t now;
+  time(&now);
+
+  // Check if NTP has synchronized (epoch > Jan 1, 2001)
+  if (now < 978307200) {
+    return "";  // NTP not synced yet, return empty string
+  }
+
   struct tm* tm_info = gmtime(&now);
   char buf[30];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
@@ -55,7 +62,6 @@ class AnchorController : public FileSystemSaveable {
   RunState queued_dir_ = IDLE;
   float queued_dur_s_ = 0.0f;
 
-  unsigned long last_sk_update_ms_ = 0;
   unsigned long last_led_toggle_ms_ = 0;
   bool led_state_ = false;
   bool relays_on_ = false;
@@ -219,9 +225,9 @@ class AnchorController : public FileSystemSaveable {
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "signalk-anchoralarm-akat";
+    src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
-    
+
     JsonObject v1 = values.add<JsonObject>();
     v1["path"] = "sensors.akat.anchor.chainOut";
     v1["value"] = chain_out_meters;
@@ -471,18 +477,20 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;  
+
+    JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>(); 
-    v["path"] = path; 
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
     v["value"] = value;
-    String payload; 
-    serializeJson(doc, payload); 
+    String payload;
+    serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
   
@@ -493,62 +501,68 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;  
+
+    JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
-    JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>(); 
-    v["path"] = path; 
-    v["value"] = value;
-    String payload; 
-    serializeJson(doc, payload); 
-    ws->sendTXT(payload);
-  }
-  
-  void sendSkDeltaFloat_(const char* path, float value) { 
-    auto app = ::sensesp::SensESPApp::get(); 
-    if (!app) return;
-    auto ws = app->get_ws_client(); 
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;  
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
     JsonObject v = values.add<JsonObject>();
     v["path"] = path;
     v["value"] = value;
-    String payload; 
-    serializeJson(doc, payload); 
+    String payload;
+    serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
   
-  void sendSkDeltaInt_(const char* path, int value) { 
-    auto app = ::sensesp::SensESPApp::get(); 
+  void sendSkDeltaFloat_(const char* path, float value) {
+    auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
-    auto ws = app->get_ws_client(); 
+    auto ws = app->get_ws_client();
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;  
+
+    JsonDocument doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
     JsonObject v = values.add<JsonObject>();
     v["path"] = path;
     v["value"] = value;
-    String payload; 
-    serializeJson(doc, payload); 
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
+  }
+  
+  void sendSkDeltaInt_(const char* path, int value) {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return;
+    auto ws = app->get_ws_client();
+    if (!ws) return;
+    extern SKWSConnectionState g_ws_state;
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
+
+    JsonDocument doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "anchorSensor";
+    JsonArray values = upd["values"].to<JsonArray>();
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
+    v["value"] = value;
+    String payload;
+    serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
   
@@ -566,9 +580,9 @@ class AnchorController : public FileSystemSaveable {
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "signalk-anchoralarm-akat";
+    src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
-    
+
     if (include_enabled) {
       JsonObject v1 = values.add<JsonObject>();
       v1["path"] = "sensors.akat.anchor.enabled";
@@ -661,61 +675,53 @@ class AnchorController : public FileSystemSaveable {
   
   void tick() {
     const unsigned long now_ms = millis();
-    
+
     // SAFETY CHECK FIRST: Stop if disconnected while running
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
       // Only stop if WE are controlling the motor (not external control)
-      if ((state == RUNNING_UP || state == RUNNING_DOWN) && !external_control_active) { 
+      if ((state == RUNNING_UP || state == RUNNING_DOWN) && !external_control_active) {
         ESP_LOGW(ANCHOR_TAG, "SAFETY: Connection lost while motor running - STOPPING");
-        stopNow_("safety:disconnected"); 
-        return; 
+        stopNow_("safety:disconnected");
+        return;
       }
     }
-    
+
     // Handle external inputs
     handleExternalInputs_();
-    
+
     // Update chain counter
     updateChainCounter();
-    
+
     // Handle neutral wait queue
     if (neutral_waiting && now_ms >= neutral_until_ms) {
       neutral_waiting = false;
       if (queued_dir_ != IDLE) {
         auto qdir = queued_dir_;
         float qdur = queued_dur_s_;
-        queued_dir_ = IDLE; 
+        queued_dir_ = IDLE;
         queued_dur_s_ = 0.0f;
         ESP_LOGI(ANCHOR_TAG, "Neutral delay complete, starting queued direction");
-        startRun_(qdir, qdur); 
+        startRun_(qdir, qdur);
         return;
       }
     }
-    
+
     // Check timeout
     if ((state == RUNNING_UP || state == RUNNING_DOWN) && now_ms >= op_end_ms) {
       stopNow_(state == RUNNING_UP ? "timeout:up" : "timeout:down");
     }
-    
-    // Send heartbeat every 2 seconds (ONLY ONE SOURCE)
-    if (g_ws_state == SKWSConnectionState::kSKWSConnected) {
-      if (now_ms - last_sk_update_ms_ >= 2000) {
-        sendHeartbeat(false);
-        last_sk_update_ms_ = now_ms;
-      }
-    }
-    
+
     // LED blink
     if (relays_on_) {
       if (now_ms - last_led_toggle_ms_ >= 1000) {
-        led_state_ = !led_state_; 
-        digitalWrite(LED_BUILTIN, led_state_ ? HIGH : LOW); 
+        led_state_ = !led_state_;
+        digitalWrite(LED_BUILTIN, led_state_ ? HIGH : LOW);
         last_led_toggle_ms_ = now_ms;
       }
-    } else if (led_state_) { 
-      led_state_ = false; 
-      digitalWrite(LED_BUILTIN, LOW); 
+    } else if (led_state_) {
+      led_state_ = false;
+      digitalWrite(LED_BUILTIN, LOW);
     }
   }
 
@@ -877,34 +883,46 @@ void setup() {
   ESP_LOGI(ANCHOR_TAG, "Chain counter: %.1fm loaded from memory", anchor->chain_out_meters);
 }
 
-void loop() { 
-  event_loop()->tick(); 
-  
+void loop() {
+  event_loop()->tick();
+
   if (anchor) anchor->tick();
-  
+
+  unsigned long now_ms = millis();
+
   // Send initial enabled=true after connection
   static bool enabled_sent = false;
-  if (g_ws_state == SKWSConnectionState::kSKWSConnected && 
-      g_connection_time > 0 && 
+  if (g_ws_state == SKWSConnectionState::kSKWSConnected &&
+      g_connection_time > 0 &&
       !enabled_sent &&
-      (millis() - g_connection_time > 500) && 
-      (millis() - g_connection_time < 1000)) {
+      (now_ms - g_connection_time > 500) &&
+      (now_ms - g_connection_time < 1000)) {
     if (anchor) {
       ESP_LOGI(ANCHOR_TAG, "Sending initial enabled=true to SignalK");
       anchor->sendHeartbeat(true);
       enabled_sent = true;
     }
   }
-  
+
   if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
     enabled_sent = false;
   }
-  
-  // NO additional heartbeat in loop - only the one in tick() every 2s
-  
+
+  // Send heartbeat every 2 seconds - MOVED HERE for consistent timing
+  static unsigned long last_heartbeat_ms = 0;
+  if (g_ws_state == SKWSConnectionState::kSKWSConnected && anchor) {
+    if (now_ms - last_heartbeat_ms >= 2000) {
+      unsigned long interval = (last_heartbeat_ms > 0) ? (now_ms - last_heartbeat_ms) : 0;
+      anchor->sendHeartbeat(false);
+      last_heartbeat_ms = now_ms;
+      if (interval > 0) {
+        ESP_LOGD(ANCHOR_TAG, "Heartbeat sent (interval: %lums)", interval);
+      }
+    }
+  }
+
   // WiFi diagnostics
   static unsigned long last_wifi_log = 0;
-  unsigned long now_ms = millis();
   if (now_ms - last_wifi_log > 60000UL) {
     last_wifi_log = now_ms;
     if (WiFi.isConnected()) {

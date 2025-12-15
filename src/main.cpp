@@ -52,6 +52,8 @@ class AnchorController : public FileSystemSaveable {
   unsigned long last_pulse_ms = 0;
   unsigned long sensor_stable_since = 0;
   bool sensor_stable_state = HIGH;
+  float last_saved_chain_meters = 0.0f;
+  unsigned long last_chain_save_ms = 0;
 
   enum RunState { IDLE, RUNNING_UP, RUNNING_DOWN, FAULT };
   RunState state = IDLE;
@@ -181,6 +183,15 @@ class AnchorController : public FileSystemSaveable {
         
         sendChainUpdate_();
         checkBuzzerThresholds(prevChainOut, chain_out_meters, state == RUNNING_DOWN);
+
+        // Auto-save on significant change (5m threshold)
+        float change = abs(chain_out_meters - last_saved_chain_meters);
+        if (change >= 5.0f) {
+          save();
+          last_saved_chain_meters = chain_out_meters;
+          last_chain_save_ms = now_ms;
+          ESP_LOGI(ANCHOR_TAG, "Chain counter auto-saved (5m threshold): %.1fm", chain_out_meters);
+        }
       }
     }
   }
@@ -188,6 +199,8 @@ class AnchorController : public FileSystemSaveable {
   void resetChainCounter() {
     chain_out_meters = 0.0f;
     chain_pulse_count = 0;
+    last_saved_chain_meters = 0.0f;
+    last_chain_save_ms = millis();
 
     // Reset buzzer alert data
     buzzer_last_alert_threshold = 0.0f;
@@ -652,9 +665,11 @@ class AnchorController : public FileSystemSaveable {
       chain_out_meters = meters;
       if (chain_out_meters < 0.0f) chain_out_meters = 0.0f;
       chain_pulse_count = (int)(chain_out_meters / chain_calibration);
-      
+
       ESP_LOGI(ANCHOR_TAG, "Chain counter SET to %.1fm via SignalK", chain_out_meters);
       save();
+      last_saved_chain_meters = chain_out_meters;
+      last_chain_save_ms = millis();
       sendChainUpdate_();
     }));
     
@@ -709,6 +724,24 @@ class AnchorController : public FileSystemSaveable {
       stopNow_(state == RUNNING_UP ? "timeout:up" : "timeout:down");
     }
 
+    // Periodic auto-save (every 30s if there's unsaved data)
+    // Only check every 5s to reduce CPU load
+    static unsigned long last_save_check_ms = 0;
+    if (now_ms - last_save_check_ms >= 5000) {
+      last_save_check_ms = now_ms;
+
+      if (chain_out_meters != last_saved_chain_meters) {
+        if (last_chain_save_ms == 0 || (now_ms - last_chain_save_ms >= 30000)) {
+          ESP_LOGI(ANCHOR_TAG, "Chain counter auto-saving: current=%.1fm, last_saved=%.1fm, time_since_save=%lums",
+                   chain_out_meters, last_saved_chain_meters, now_ms - last_chain_save_ms);
+          save();
+          last_saved_chain_meters = chain_out_meters;
+          last_chain_save_ms = now_ms;
+          ESP_LOGI(ANCHOR_TAG, "Chain counter auto-saved (30s periodic): %.1fm", chain_out_meters);
+        }
+      }
+    }
+
     // LED blink
     if (relays_on_) {
       if (now_ms - last_led_toggle_ms_ >= 1000) {
@@ -757,7 +790,11 @@ class AnchorController : public FileSystemSaveable {
     if (c["chain_sensor_pullup"].is<bool>()) chain_sensor_pullup = c["chain_sensor_pullup"].as<bool>();
     if (c["chain_calibration"].is<float>()) chain_calibration = c["chain_calibration"].as<float>();
     if (c["pulse_debounce_ms"].is<int>()) pulse_debounce_ms = c["pulse_debounce_ms"].as<int>();
-    if (c["chain_out_meters"].is<float>()) chain_out_meters = c["chain_out_meters"].as<float>();
+    if (c["chain_out_meters"].is<float>()) {
+      chain_out_meters = c["chain_out_meters"].as<float>();
+      last_saved_chain_meters = chain_out_meters;  // Sync on load
+      last_chain_save_ms = millis();
+    }
     if (c["ext_up_gpio"].is<int>()) ext_up_gpio = c["ext_up_gpio"].as<int>();
     if (c["ext_down_gpio"].is<int>()) ext_down_gpio = c["ext_down_gpio"].as<int>();
     if (c["ext_input_active_high"].is<bool>()) ext_input_active_high = c["ext_input_active_high"].as<bool>();

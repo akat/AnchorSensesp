@@ -600,14 +600,9 @@ class AnchorController : public FileSystemSaveable {
     JsonObject v4 = values.add<JsonObject>();
     v4["path"] = "sensors.akat.anchor.state";
     v4["value"] = stateToString_();
-    
-    // Add external control status
-    JsonObject v5 = values.add<JsonObject>();
-    v5["path"] = "sensors.akat.anchor.externalControl.active";
-    v5["value"] = external_control_active;
-    
+
     String payload;
-    serializeJson(doc, payload); 
+    serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
   

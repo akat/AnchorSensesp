@@ -92,6 +92,8 @@ class AnchorController : public FileSystemSaveable {
   String buzzer_last_alert_time = "";
 
   StringSKListener* sk_command_listener = nullptr;
+  FloatSKListener* sk_chain_set_listener = nullptr;
+  BoolSKListener* sk_chain_reset_listener = nullptr;
 
   void setupPins() {
     pinMode(relay_up_pin, OUTPUT);
@@ -201,7 +203,7 @@ class AnchorController : public FileSystemSaveable {
     sendSkDeltaString_("sensors.akat.anchor.alert.firedAt", buzzer_last_alert_time);
 
     // Send empty buzzer event to clear any previous alerts
-    JsonDocument resetDoc;
+    StaticJsonDocument<128> resetDoc;
     JsonObject resetEv = resetDoc.to<JsonObject>();
     resetEv["beeps"] = 0;
     resetEv["threshold"] = 0.0f;
@@ -218,8 +220,8 @@ class AnchorController : public FileSystemSaveable {
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;
+
+    StaticJsonDocument<512> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -363,7 +365,7 @@ class AnchorController : public FileSystemSaveable {
     buzzer_last_alert_beeps = beeps;
     buzzer_last_alert_time = isoTimestamp();
 
-    JsonDocument doc;
+    StaticJsonDocument<256> doc;
     JsonObject ev = doc.to<JsonObject>();
     ev["beeps"] = beeps;
     ev["threshold"] = thresh;
@@ -478,7 +480,7 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
-    JsonDocument doc;
+    StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -502,7 +504,7 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
-    JsonDocument doc;
+    StaticJsonDocument<512> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -526,7 +528,7 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
-    JsonDocument doc;
+    StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -550,7 +552,7 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
-    JsonDocument doc;
+    StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -567,14 +569,14 @@ class AnchorController : public FileSystemSaveable {
   }
   
   void sendHeartbeat(bool include_enabled = false) {
-    auto app = ::sensesp::SensESPApp::get(); 
+    auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
-    auto ws = app->get_ws_client(); 
+    auto ws = app->get_ws_client();
     if (!ws) return;
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-    
-    JsonDocument doc;
+
+    StaticJsonDocument<768> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
@@ -639,8 +641,8 @@ class AnchorController : public FileSystemSaveable {
       }
     }));
     
-    auto chain_set_listener = new FloatSKListener("sensors.akat.anchor.chainOutSet", 500);
-    chain_set_listener->connect_to(new LambdaConsumer<float>([this](float meters) {
+    sk_chain_set_listener = new FloatSKListener("sensors.akat.anchor.chainOutSet", 500);
+    sk_chain_set_listener->connect_to(new LambdaConsumer<float>([this](float meters) {
       extern SKWSConnectionState g_ws_state;
       extern unsigned long g_connection_time;
       
@@ -656,8 +658,8 @@ class AnchorController : public FileSystemSaveable {
       sendChainUpdate_();
     }));
     
-    auto chain_reset_listener = new BoolSKListener("sensors.akat.anchor.resetChainCounter", 500);
-    chain_reset_listener->connect_to(new LambdaConsumer<bool>([this](bool reset) {
+    sk_chain_reset_listener = new BoolSKListener("sensors.akat.anchor.resetChainCounter", 500);
+    sk_chain_reset_listener->connect_to(new LambdaConsumer<bool>([this](bool reset) {
       extern SKWSConnectionState g_ws_state;
       extern unsigned long g_connection_time;
       

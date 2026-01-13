@@ -227,6 +227,10 @@ class AnchorController : public FileSystemSaveable {
   }
   
   void sendChainUpdate_() {
+    static unsigned long chain_update_count = 0;
+    chain_update_count++;
+    ESP_LOGD(ANCHOR_TAG, "Sending chain update #%lu", chain_update_count);
+
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
     auto ws = app->get_ws_client();
@@ -236,6 +240,7 @@ class AnchorController : public FileSystemSaveable {
 
     StaticJsonDocument<512> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -257,8 +262,8 @@ class AnchorController : public FileSystemSaveable {
   }
   
   void publishState_() {
-    // Μην στέλνεις state update - το heartbeat το κάνει
-    // Αυτό προκαλεί διπλά updates
+    sendSkDeltaString_("sensors.akat.anchor.state", stateToString_());
+
   }
   
   String stateToString_() {
@@ -400,7 +405,7 @@ class AnchorController : public FileSystemSaveable {
     op_end_ms = 0; 
     op_start_ms = 0; 
     neutral_waiting = false;
-    // publishState_(); // REMOVED - το heartbeat θα το στείλει
+    publishState_();
     ESP_LOGI(ANCHOR_TAG, "Motor STOPPED: %s", reason);
   }
   
@@ -419,7 +424,7 @@ class AnchorController : public FileSystemSaveable {
       ESP_LOGI(ANCHOR_TAG, "Motor START: DOWN for %.1fs", seconds);
     }
     
-    // publishState_(); // REMOVED - το heartbeat θα το στείλει
+    publishState_();
   }
   
   void runDirection_(RunState dir, float seconds) {
@@ -495,6 +500,7 @@ class AnchorController : public FileSystemSaveable {
 
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -519,6 +525,7 @@ class AnchorController : public FileSystemSaveable {
 
     StaticJsonDocument<512> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -543,6 +550,7 @@ class AnchorController : public FileSystemSaveable {
 
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -567,6 +575,7 @@ class AnchorController : public FileSystemSaveable {
 
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -589,8 +598,45 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
+    // Track heartbeat send attempts to detect blocking
+    static unsigned long last_send_start_ms = 0;
+    static bool send_in_progress = false;
+    unsigned long now = millis();
+
+    // Check if previous send is still in progress (blocking detected)
+    if (send_in_progress && (now - last_send_start_ms > 2000)) {
+      ESP_LOGE(ANCHOR_TAG, "CRITICAL: sendHeartbeat() blocked for %lums, previous send still pending!",
+               now - last_send_start_ms);
+      ESP_LOGE(ANCHOR_TAG, "Possible TCP buffer full or server not reading data");
+
+      // Force WebSocket restart if blocked for >10 seconds
+      if (now - last_send_start_ms > 10000) {
+        ESP_LOGE(ANCHOR_TAG, "Emergency: sendTXT blocked for %lu seconds, forcing WebSocket restart",
+                 (now - last_send_start_ms) / 1000);
+        if (auto app_restart = ::sensesp::SensESPApp::get()) {
+          auto ws_restart = app_restart->get_ws_client();
+          if (ws_restart) {
+            ws_restart->restart();
+          }
+        }
+      }
+
+      send_in_progress = false;  // Reset to allow retry
+      return;  // Skip this heartbeat to prevent further blocking
+    }
+
+    // Don't start new send if one is already in progress
+    if (send_in_progress) {
+      ESP_LOGW(ANCHOR_TAG, "Heartbeat send already in progress, skipping");
+      return;
+    }
+
+    last_send_start_ms = now;
+    send_in_progress = true;
+
     StaticJsonDocument<768> doc;
     JsonObject root = doc.to<JsonObject>();
+    root["type"] = "delta";
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
@@ -603,22 +649,37 @@ class AnchorController : public FileSystemSaveable {
       v1["path"] = "sensors.akat.anchor.enabled";
       v1["value"] = enabled;
     }
-    
+
     JsonObject v2 = values.add<JsonObject>();
     v2["path"] = "sensors.akat.anchor.lastUpdate";
     v2["value"] = isoTimestamp();
-    
+
     JsonObject v3 = values.add<JsonObject>();
     v3["path"] = "sensors.akat.anchor.chainOut";
     v3["value"] = chain_out_meters;
-    
+
     JsonObject v4 = values.add<JsonObject>();
     v4["path"] = "sensors.akat.anchor.state";
     v4["value"] = stateToString_();
 
+    // Προσθήκη chainPulses
+    JsonObject v5 = values.add<JsonObject>();
+    v5["path"] = "sensors.akat.anchor.chainPulses";
+    v5["value"] = chain_pulse_count;
+
     String payload;
     serializeJson(doc, payload);
+
+    // Send with monitoring
+    unsigned long send_start = millis();
     ws->sendTXT(payload);
+    unsigned long send_duration = millis() - send_start;
+    send_in_progress = false;
+
+    // Warn if send took too long
+    if (send_duration > 500) {
+      ESP_LOGW(ANCHOR_TAG, "Heartbeat send took %lums (slow connection)", send_duration);
+    }
   }
   
   void attachSignalK() {
@@ -878,33 +939,32 @@ void setup() {
       ws->connect_to(new LambdaConsumer<SKWSConnectionState>([ws](SKWSConnectionState state) {
         SKWSConnectionState prev_state = g_ws_state;
         g_ws_state = state;
-        
+
         switch (state) {
           case SKWSConnectionState::kSKWSDisconnected:
             ESP_LOGW(ANCHOR_TAG, "SignalK WebSocket: Disconnected");
             g_connection_time = 0;
-            if (anchor && (anchor->state == AnchorController::RUNNING_UP || 
+            if (anchor && (anchor->state == AnchorController::RUNNING_UP ||
                           anchor->state == AnchorController::RUNNING_DOWN)) {
               ESP_LOGW(ANCHOR_TAG, "SAFETY: Stopping motor due to disconnection");
               anchor->stopNow_("safety:disconnected");
             }
             break;
-            
+
           case SKWSConnectionState::kSKWSAuthorizing:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Authorizing");
             break;
-            
+
           case SKWSConnectionState::kSKWSConnecting:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Connecting");
             break;
-            
+
           case SKWSConnectionState::kSKWSConnected:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Connected");
             g_connection_time = millis();
-            // Reset listeners' settling period
             ESP_LOGI(ANCHOR_TAG, "Connection settling period: 2 seconds");
             break;
-            
+
           default:
             ESP_LOGD(ANCHOR_TAG, "SignalK WebSocket: state=%d", (int)state);
             break;
@@ -923,6 +983,14 @@ void loop() {
   if (anchor) anchor->tick();
 
   unsigned long now_ms = millis();
+
+  // Handle millis() overflow (every ~49 days)
+  static unsigned long last_millis = 0;
+  if (now_ms < last_millis) {
+    ESP_LOGW(ANCHOR_TAG, "millis() overflow detected, resetting timers");
+    // Reset will be handled by static variable resets below
+  }
+  last_millis = now_ms;
 
   // Send initial enabled=true after connection
   static bool enabled_sent = false;
@@ -944,26 +1012,99 @@ void loop() {
 
   // Send heartbeat every 2 seconds - MOVED HERE for consistent timing
   static unsigned long last_heartbeat_ms = 0;
+  static unsigned long last_heartbeat_attempt_ms = 0;
+  static unsigned long message_count = 0;
+  static unsigned long last_log_time = 0;
+  static uint8_t heartbeat_fail_count = 0;
+
   if (g_ws_state == SKWSConnectionState::kSKWSConnected && anchor) {
     if (now_ms - last_heartbeat_ms >= 2000) {
       unsigned long interval = (last_heartbeat_ms > 0) ? (now_ms - last_heartbeat_ms) : 0;
-      anchor->sendHeartbeat(false);
-      last_heartbeat_ms = now_ms;
-      if (interval > 0) {
-        ESP_LOGD(ANCHOR_TAG, "Heartbeat sent (interval: %lums)", interval);
+
+      // Verify WebSocket is actually working
+      if (auto app = ::sensesp::SensESPApp::get()) {
+        auto ws = app->get_ws_client();
+        if (ws && ws->is_connected()) {
+          anchor->sendHeartbeat(false);
+          last_heartbeat_ms = now_ms;
+          last_heartbeat_attempt_ms = now_ms;
+          heartbeat_fail_count = 0;
+          message_count++;
+          if (interval > 0) {
+            ESP_LOGD(ANCHOR_TAG, "Heartbeat sent (interval: %lums)", interval);
+          }
+        } else {
+          // WebSocket claims connected but is_connected() returns false
+          ESP_LOGW(ANCHOR_TAG, "Heartbeat SKIPPED: WebSocket state mismatch (connected=%d)",
+                   ws ? ws->is_connected() : false);
+          heartbeat_fail_count++;
+          last_heartbeat_attempt_ms = now_ms;
+        }
       }
+
+      // Log message frequency every 60 seconds
+      if (now_ms - last_log_time >= 60000) {
+        ESP_LOGI(ANCHOR_TAG, "Network stats: %lu heartbeats sent in last 60s (avg %.1f/min)",
+                 message_count, message_count);
+        message_count = 0;
+        last_log_time = now_ms;
+      }
+    }
+
+    // WATCHDOG: If heartbeats are failing consecutively, force reconnect
+    if (heartbeat_fail_count >= 3 && (now_ms - last_heartbeat_attempt_ms >= 10000)) {
+      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: Heartbeat failed %d times, forcing reconnection", heartbeat_fail_count);
+      if (auto app = ::sensesp::SensESPApp::get()) {
+        auto ws = app->get_ws_client();
+        if (ws) {
+          ws->restart();
+          heartbeat_fail_count = 0;
+        }
+      }
+    }
+
+    // Additional connection health check: if no heartbeat sent for >10s (should be 2s interval)
+    if (last_heartbeat_ms > 0 && (now_ms - last_heartbeat_ms > 10000)) {
+      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: No heartbeat sent for %lu seconds, connection may be stale",
+               (now_ms - last_heartbeat_ms) / 1000);
+      if (auto app = ::sensesp::SensESPApp::get()) {
+        auto ws = app->get_ws_client();
+        if (ws) {
+          ESP_LOGW(ANCHOR_TAG, "Forcing WebSocket restart due to stale connection");
+          ws->restart();
+          last_heartbeat_ms = 0;
+          heartbeat_fail_count = 0;
+        }
+      }
+    }
+  } else {
+    // Reset heartbeat tracking when disconnected
+    if (last_heartbeat_ms > 0) {
+      ESP_LOGD(ANCHOR_TAG, "Heartbeat tracking reset (disconnected)");
+      last_heartbeat_ms = 0;
+      heartbeat_fail_count = 0;
     }
   }
 
-  // WiFi diagnostics
+  // WiFi diagnostics and reconnection
   static unsigned long last_wifi_log = 0;
+  static unsigned long wifi_disconnected_since = 0;
   if (now_ms - last_wifi_log > 60000UL) {
     last_wifi_log = now_ms;
     if (WiFi.isConnected()) {
-      ESP_LOGI(ANCHOR_TAG, "WiFi: IP=%s RSSI=%d", 
+      ESP_LOGI(ANCHOR_TAG, "WiFi: IP=%s RSSI=%d",
                WiFi.localIP().toString().c_str(), WiFi.RSSI());
+      wifi_disconnected_since = 0;
     } else {
       ESP_LOGW(ANCHOR_TAG, "WiFi: disconnected");
+      if (wifi_disconnected_since == 0) wifi_disconnected_since = now_ms;
+
+      // If WiFi disconnected for more than 2 minutes, restart ESP32
+      if (now_ms - wifi_disconnected_since > 120000UL) {
+        ESP_LOGE(ANCHOR_TAG, "WiFi disconnected for 2+ minutes, restarting ESP32");
+        delay(100);
+        ESP.restart();
+      }
     }
   }
   

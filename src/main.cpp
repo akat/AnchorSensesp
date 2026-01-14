@@ -981,9 +981,10 @@ void loop() {
   // =====================================================
   // WATCHDOG: WiFi & WebSocket connection monitoring
   // =====================================================
+  // Note: SensESP handles WebSocket reconnection automatically.
+  // We only restart ESP32 if connection fails for too long.
   static unsigned long wifi_disconnect_since = 0;
   static unsigned long ws_disconnect_since = 0;
-  static uint8_t ws_reconnect_attempts = 0;
 
   // --- WiFi Watchdog ---
   if (!WiFi.isConnected()) {
@@ -1014,38 +1015,18 @@ void loop() {
                (now_ms - wifi_disconnect_since) / 1000);
       wifi_disconnect_since = 0;
     }
-
-    // Log WiFi status every 5 minutes when connected
-    static unsigned long last_wifi_log = 0;
-    if (now_ms - last_wifi_log > 300000UL) {
-      last_wifi_log = now_ms;
-      ESP_LOGI(ANCHOR_TAG, "WiFi: IP=%s RSSI=%d dBm",
-               WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    }
   }
 
   // --- WebSocket Watchdog (only if WiFi is connected) ---
+  // SensESP handles reconnection automatically - we only restart if it fails too long
   if (WiFi.isConnected()) {
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
       if (ws_disconnect_since == 0) {
         ws_disconnect_since = now_ms;
-        ESP_LOGW(ANCHOR_TAG, "WebSocket: disconnected, starting watchdog timer");
+        ESP_LOGW(ANCHOR_TAG, "WebSocket: disconnected, SensESP will handle reconnection");
       }
 
       unsigned long ws_down_time = now_ms - ws_disconnect_since;
-
-      // Try to reconnect every 30 seconds
-      if (ws_down_time > 30000UL && (ws_down_time / 30000UL) > ws_reconnect_attempts) {
-        ws_reconnect_attempts++;
-        ESP_LOGW(ANCHOR_TAG, "WebSocket: reconnect attempt %d", ws_reconnect_attempts);
-
-        if (auto app = ::sensesp::SensESPApp::get()) {
-          auto ws = app->get_ws_client();
-          if (ws) {
-            ws->connect();
-          }
-        }
-      }
 
       // After 5 minutes without WebSocket (while WiFi is up), restart ESP32
       if (ws_down_time > 300000UL) {
@@ -1056,16 +1037,14 @@ void loop() {
     } else {
       // WebSocket is connected
       if (ws_disconnect_since != 0) {
-        ESP_LOGI(ANCHOR_TAG, "WebSocket: reconnected after %lu seconds (attempts: %d)",
-                 (now_ms - ws_disconnect_since) / 1000, ws_reconnect_attempts);
+        ESP_LOGI(ANCHOR_TAG, "WebSocket: reconnected after %lu seconds",
+                 (now_ms - ws_disconnect_since) / 1000);
         ws_disconnect_since = 0;
-        ws_reconnect_attempts = 0;
       }
     }
   } else {
-    // WiFi is down, reset WebSocket watchdog (will restart when WiFi is back)
+    // WiFi is down, reset WebSocket watchdog
     ws_disconnect_since = 0;
-    ws_reconnect_attempts = 0;
   }
 
   // --- Memory & Health diagnostics (every 10 minutes) ---

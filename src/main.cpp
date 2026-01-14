@@ -17,11 +17,8 @@ static String isoTimestamp() {
   time_t now;
   time(&now);
 
-  // Check if NTP has synchronized (epoch > Jan 1, 2001)
-  if (now < 978307200) {
-    return "";  // NTP not synced yet, return empty string
-  }
-
+  // Always return a timestamp - use epoch if NTP not synced yet
+  // (NTP synced check: epoch > Jan 1, 2001)
   struct tm* tm_info = gmtime(&now);
   char buf[30];
   strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", tm_info);
@@ -257,8 +254,7 @@ class AnchorController : public FileSystemSaveable {
   }
   
   void publishState_() {
-    // Μην στέλνεις state update - το heartbeat το κάνει
-    // Αυτό προκαλεί διπλά updates
+    sendSkDeltaString_("sensors.akat.anchor.state", stateToString_());
   }
   
   String stateToString_() {
@@ -395,12 +391,12 @@ class AnchorController : public FileSystemSaveable {
   }
 
   void stopNow_(const char* reason = "stop") {
-    relaysOff_(); 
+    relaysOff_();
     state = IDLE;
-    op_end_ms = 0; 
-    op_start_ms = 0; 
+    op_end_ms = 0;
+    op_start_ms = 0;
     neutral_waiting = false;
-    // publishState_(); // REMOVED - το heartbeat θα το στείλει
+    publishState_();
     ESP_LOGI(ANCHOR_TAG, "Motor STOPPED: %s", reason);
   }
   
@@ -408,18 +404,18 @@ class AnchorController : public FileSystemSaveable {
     const unsigned long now_ms = millis();
     op_start_ms = now_ms;
     op_end_ms = now_ms + (unsigned long)(seconds * 1000.0f);
-    
-    if (dir == RUNNING_UP) { 
-      relayUpOn_();   
+
+    if (dir == RUNNING_UP) {
+      relayUpOn_();
       state = RUNNING_UP;
       ESP_LOGI(ANCHOR_TAG, "Motor START: UP for %.1fs", seconds);
-    } else if (dir == RUNNING_DOWN) { 
-      relayDownOn_(); 
+    } else if (dir == RUNNING_DOWN) {
+      relayDownOn_();
       state = RUNNING_DOWN;
       ESP_LOGI(ANCHOR_TAG, "Motor START: DOWN for %.1fs", seconds);
     }
-    
-    // publishState_(); // REMOVED - το heartbeat θα το στείλει
+
+    publishState_();
   }
   
   void runDirection_(RunState dir, float seconds) {
@@ -581,7 +577,7 @@ class AnchorController : public FileSystemSaveable {
     ws->sendTXT(payload);
   }
   
-  void sendHeartbeat(bool include_enabled = false) {
+  void sendHeartbeat() {
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
     auto ws = app->get_ws_client();
@@ -598,20 +594,18 @@ class AnchorController : public FileSystemSaveable {
     src["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
 
-    if (include_enabled) {
-      JsonObject v1 = values.add<JsonObject>();
-      v1["path"] = "sensors.akat.anchor.enabled";
-      v1["value"] = enabled;
-    }
-    
+    JsonObject v1 = values.add<JsonObject>();
+    v1["path"] = "sensors.akat.anchor.enabled";
+    v1["value"] = enabled;
+
     JsonObject v2 = values.add<JsonObject>();
     v2["path"] = "sensors.akat.anchor.lastUpdate";
     v2["value"] = isoTimestamp();
-    
+
     JsonObject v3 = values.add<JsonObject>();
     v3["path"] = "sensors.akat.anchor.chainOut";
     v3["value"] = chain_out_meters;
-    
+
     JsonObject v4 = values.add<JsonObject>();
     v4["path"] = "sensors.akat.anchor.state";
     v4["value"] = stateToString_();
@@ -878,33 +872,32 @@ void setup() {
       ws->connect_to(new LambdaConsumer<SKWSConnectionState>([ws](SKWSConnectionState state) {
         SKWSConnectionState prev_state = g_ws_state;
         g_ws_state = state;
-        
+
         switch (state) {
           case SKWSConnectionState::kSKWSDisconnected:
             ESP_LOGW(ANCHOR_TAG, "SignalK WebSocket: Disconnected");
             g_connection_time = 0;
-            if (anchor && (anchor->state == AnchorController::RUNNING_UP || 
+            if (anchor && (anchor->state == AnchorController::RUNNING_UP ||
                           anchor->state == AnchorController::RUNNING_DOWN)) {
               ESP_LOGW(ANCHOR_TAG, "SAFETY: Stopping motor due to disconnection");
               anchor->stopNow_("safety:disconnected");
             }
             break;
-            
+
           case SKWSConnectionState::kSKWSAuthorizing:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Authorizing");
             break;
-            
+
           case SKWSConnectionState::kSKWSConnecting:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Connecting");
             break;
-            
+
           case SKWSConnectionState::kSKWSConnected:
             ESP_LOGI(ANCHOR_TAG, "SignalK WebSocket: Connected");
             g_connection_time = millis();
-            // Reset listeners' settling period
             ESP_LOGI(ANCHOR_TAG, "Connection settling period: 2 seconds");
             break;
-            
+
           default:
             ESP_LOGD(ANCHOR_TAG, "SignalK WebSocket: state=%d", (int)state);
             break;
@@ -924,74 +917,162 @@ void loop() {
 
   unsigned long now_ms = millis();
 
-  // Send initial enabled=true after connection
-  static bool enabled_sent = false;
+  // Send custom subscription with clientName shortly after connection
+  static bool custom_subscription_sent = false;
   if (g_ws_state == SKWSConnectionState::kSKWSConnected &&
       g_connection_time > 0 &&
-      !enabled_sent &&
-      (now_ms - g_connection_time > 500) &&
-      (now_ms - g_connection_time < 1000)) {
-    if (anchor) {
-      ESP_LOGI(ANCHOR_TAG, "Sending initial enabled=true to SignalK");
-      anchor->sendHeartbeat(true);
-      enabled_sent = true;
+      !custom_subscription_sent &&
+      (now_ms - g_connection_time > 300) &&
+      (now_ms - g_connection_time < 600)) {
+    if (auto app = ::sensesp::SensESPApp::get()) {
+      auto ws = app->get_ws_client();
+      if (ws) {
+        StaticJsonDocument<256> subDoc;
+        subDoc["clientName"] = "Anchor Guard";
+        subDoc["context"] = "vessels.self";
+        JsonArray subscribe = subDoc["subscribe"].to<JsonArray>();
+        JsonObject sub1 = subscribe.add<JsonObject>();
+        sub1["path"] = "sensors.akat.anchor.command";
+        JsonObject sub2 = subscribe.add<JsonObject>();
+        sub2["path"] = "sensors.akat.anchor.chainOutSet";
+        JsonObject sub3 = subscribe.add<JsonObject>();
+        sub3["path"] = "sensors.akat.anchor.resetChainCounter";
+
+        String subPayload;
+        serializeJson(subDoc, subPayload);
+        ESP_LOGI(ANCHOR_TAG, "Sending custom subscription with clientName: %s", subPayload.c_str());
+        ws->sendTXT(subPayload);
+        custom_subscription_sent = true;
+      }
     }
   }
 
   if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-    enabled_sent = false;
+    custom_subscription_sent = false;
   }
 
-  // Send heartbeat every 2 seconds - MOVED HERE for consistent timing
+  // Send initial heartbeat shortly after connection
+  static bool initial_heartbeat_sent = false;
+  if (g_ws_state == SKWSConnectionState::kSKWSConnected &&
+      g_connection_time > 0 &&
+      !initial_heartbeat_sent &&
+      (now_ms - g_connection_time > 500) &&
+      (now_ms - g_connection_time < 1000)) {
+    if (anchor) {
+      ESP_LOGI(ANCHOR_TAG, "Sending initial heartbeat to SignalK");
+      anchor->sendHeartbeat();
+      initial_heartbeat_sent = true;
+    }
+  }
+
+  if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
+    initial_heartbeat_sent = false;
+  }
+
+  // Send heartbeat every 5 seconds
   static unsigned long last_heartbeat_ms = 0;
   if (g_ws_state == SKWSConnectionState::kSKWSConnected && anchor) {
-    if (now_ms - last_heartbeat_ms >= 2000) {
-      unsigned long interval = (last_heartbeat_ms > 0) ? (now_ms - last_heartbeat_ms) : 0;
-      anchor->sendHeartbeat(false);
+    if (now_ms - last_heartbeat_ms >= 5000) {
+      anchor->sendHeartbeat();
       last_heartbeat_ms = now_ms;
-      if (interval > 0) {
-        ESP_LOGD(ANCHOR_TAG, "Heartbeat sent (interval: %lums)", interval);
-      }
     }
   }
 
-  // WiFi diagnostics
-  static unsigned long last_wifi_log = 0;
-  if (now_ms - last_wifi_log > 60000UL) {
-    last_wifi_log = now_ms;
-    if (WiFi.isConnected()) {
-      ESP_LOGI(ANCHOR_TAG, "WiFi: IP=%s RSSI=%d", 
+  // =====================================================
+  // WATCHDOG: WiFi & WebSocket connection monitoring
+  // =====================================================
+  static unsigned long wifi_disconnect_since = 0;
+  static unsigned long ws_disconnect_since = 0;
+  static uint8_t ws_reconnect_attempts = 0;
+
+  // --- WiFi Watchdog ---
+  if (!WiFi.isConnected()) {
+    if (wifi_disconnect_since == 0) {
+      wifi_disconnect_since = now_ms;
+      ESP_LOGW(ANCHOR_TAG, "WiFi: disconnected, starting watchdog timer");
+    }
+
+    unsigned long wifi_down_time = now_ms - wifi_disconnect_since;
+
+    // Log every 30 seconds while disconnected
+    static unsigned long last_wifi_warn = 0;
+    if (now_ms - last_wifi_warn > 30000UL) {
+      last_wifi_warn = now_ms;
+      ESP_LOGW(ANCHOR_TAG, "WiFi: still disconnected for %lu seconds", wifi_down_time / 1000);
+    }
+
+    // After 3 minutes without WiFi, restart ESP32
+    if (wifi_down_time > 180000UL) {
+      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WiFi disconnected for 3 minutes - RESTARTING ESP32");
+      delay(100);
+      ESP.restart();
+    }
+  } else {
+    // WiFi is connected
+    if (wifi_disconnect_since != 0) {
+      ESP_LOGI(ANCHOR_TAG, "WiFi: reconnected after %lu seconds",
+               (now_ms - wifi_disconnect_since) / 1000);
+      wifi_disconnect_since = 0;
+    }
+
+    // Log WiFi status every 5 minutes when connected
+    static unsigned long last_wifi_log = 0;
+    if (now_ms - last_wifi_log > 300000UL) {
+      last_wifi_log = now_ms;
+      ESP_LOGI(ANCHOR_TAG, "WiFi: IP=%s RSSI=%d dBm",
                WiFi.localIP().toString().c_str(), WiFi.RSSI());
-    } else {
-      ESP_LOGW(ANCHOR_TAG, "WiFi: disconnected");
     }
   }
-  
-  // Reconnection watchdog
-  static unsigned long not_connected_since = 0;
-  static uint8_t reconnect_attempts = 0;
-  if (auto app = ::sensesp::SensESPApp::get()) {
-    auto ws = app->get_ws_client();
-    if (ws) {
-      if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-        if (not_connected_since == 0) not_connected_since = now_ms;
-        
-        if (now_ms - not_connected_since > 60000UL) {
-          ESP_LOGW(ANCHOR_TAG, "Watchdog: forcing reconnect (attempt %d)", reconnect_attempts + 1);
-          ws->connect();
-          not_connected_since = now_ms;
-          reconnect_attempts++;
-          
-          if (reconnect_attempts >= 8) {
-            ESP_LOGE(ANCHOR_TAG, "Watchdog: exceeded attempts, restarting ESP32");
-            delay(100);
-            ESP.restart();
+
+  // --- WebSocket Watchdog (only if WiFi is connected) ---
+  if (WiFi.isConnected()) {
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
+      if (ws_disconnect_since == 0) {
+        ws_disconnect_since = now_ms;
+        ESP_LOGW(ANCHOR_TAG, "WebSocket: disconnected, starting watchdog timer");
+      }
+
+      unsigned long ws_down_time = now_ms - ws_disconnect_since;
+
+      // Try to reconnect every 30 seconds
+      if (ws_down_time > 30000UL && (ws_down_time / 30000UL) > ws_reconnect_attempts) {
+        ws_reconnect_attempts++;
+        ESP_LOGW(ANCHOR_TAG, "WebSocket: reconnect attempt %d", ws_reconnect_attempts);
+
+        if (auto app = ::sensesp::SensESPApp::get()) {
+          auto ws = app->get_ws_client();
+          if (ws) {
+            ws->connect();
           }
         }
-      } else {
-        not_connected_since = 0;
-        reconnect_attempts = 0;
+      }
+
+      // After 5 minutes without WebSocket (while WiFi is up), restart ESP32
+      if (ws_down_time > 300000UL) {
+        ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WebSocket disconnected for 5 minutes - RESTARTING ESP32");
+        delay(100);
+        ESP.restart();
+      }
+    } else {
+      // WebSocket is connected
+      if (ws_disconnect_since != 0) {
+        ESP_LOGI(ANCHOR_TAG, "WebSocket: reconnected after %lu seconds (attempts: %d)",
+                 (now_ms - ws_disconnect_since) / 1000, ws_reconnect_attempts);
+        ws_disconnect_since = 0;
+        ws_reconnect_attempts = 0;
       }
     }
+  } else {
+    // WiFi is down, reset WebSocket watchdog (will restart when WiFi is back)
+    ws_disconnect_since = 0;
+    ws_reconnect_attempts = 0;
+  }
+
+  // --- Memory & Health diagnostics (every 10 minutes) ---
+  static unsigned long last_health_log = 0;
+  if (now_ms - last_health_log > 600000UL) {
+    last_health_log = now_ms;
+    ESP_LOGI(ANCHOR_TAG, "Health: Free heap=%u bytes, uptime=%lu min",
+             ESP.getFreeHeap(), now_ms / 60000UL);
   }
 }

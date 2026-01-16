@@ -1004,14 +1004,28 @@ void loop() {
   }
 
   // --- WebSocket Watchdog ---
-  // Only check after we've been connected at least once
+  // Restart on any WebSocket failure (even if we never connected).
+  static unsigned long ws_disconnect_since = 0;
+  const unsigned long ws_connect_timeout_ms = 5000;
+
   if (g_ws_state == SKWSConnectionState::kSKWSConnected) {
     was_connected = true;
-  } else if (was_connected) {
-    // We were connected before but lost WebSocket (regardless of WiFi state)
-    ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WebSocket lost - RESTARTING ESP32");
-    delay(100);
-    ESP.restart();
+    ws_disconnect_since = 0;
+  } else if (WiFi.isConnected()) {
+    if (ws_disconnect_since == 0) {
+      ws_disconnect_since = now_ms;
+      ESP_LOGW(ANCHOR_TAG,
+               "WebSocket: disconnected, will restart in %lums unless connected",
+               ws_connect_timeout_ms);
+    }
+
+    if (was_connected || (now_ms - ws_disconnect_since >= ws_connect_timeout_ms)) {
+      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WebSocket failure - RESTARTING ESP32");
+      delay(100);
+      ESP.restart();
+    }
+  } else {
+    ws_disconnect_since = 0;
   }
 
   // --- Health diagnostics (every 10 minutes) ---

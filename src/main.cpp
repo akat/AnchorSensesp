@@ -8,6 +8,7 @@
 #include "sensesp/system/lambda_consumer.h"
 #include "sensesp/signalk/signalk_ws_client.h"
 #include <WiFi.h>
+#include <esp_attr.h>
 
 static const char* ANCHOR_TAG = "AnchorController";
 using namespace sensesp;
@@ -839,13 +840,58 @@ inline const String ConfigSchema(const AnchorController& obj) {
 std::shared_ptr<AnchorController> anchor;
 SKWSConnectionState g_ws_state = SKWSConnectionState::kSKWSDisconnected;
 unsigned long g_connection_time = 0;
+RTC_DATA_ATTR bool g_ws_watchdog_restart = false;
+RTC_DATA_ATTR uint32_t g_ws_restart_attempts = 0;
+RTC_DATA_ATTR uint32_t g_ws_last_uptime_ms = 0;
+static unsigned long g_ws_restart_blocked_until_ms = 0;
+
+static void init_ws_restart_guard() {
+  const unsigned long rapid_restart_threshold_ms = 60000UL;
+  const unsigned long base_backoff_ms = 5000UL;
+  const unsigned long max_backoff_ms = 300000UL;
+  const uint32_t backoff_start_attempt = 3;
+
+  if (g_ws_watchdog_restart) {
+    if (g_ws_last_uptime_ms > 0 &&
+        g_ws_last_uptime_ms < rapid_restart_threshold_ms) {
+      g_ws_restart_attempts++;
+    } else {
+      g_ws_restart_attempts = 1;
+    }
+
+    if (g_ws_restart_attempts >= backoff_start_attempt) {
+      unsigned long backoff = base_backoff_ms;
+      uint32_t exp = g_ws_restart_attempts - backoff_start_attempt;
+      for (uint32_t i = 0; i < exp; i++) {
+        if (backoff >= max_backoff_ms / 2) {
+          backoff = max_backoff_ms;
+          break;
+        }
+        backoff *= 2;
+      }
+      g_ws_restart_blocked_until_ms = millis() + backoff;
+      ESP_LOGW(ANCHOR_TAG,
+               "WS restart backoff active: %lu ms (attempt %lu)",
+               backoff, (unsigned long)g_ws_restart_attempts);
+    } else {
+      g_ws_restart_blocked_until_ms = 0;
+    }
+  } else {
+    g_ws_restart_attempts = 0;
+    g_ws_restart_blocked_until_ms = 0;
+  }
+
+  g_ws_watchdog_restart = false;
+  g_ws_last_uptime_ms = 0;
+}
 
 void setup() {
   SetupLogging();
+  init_ws_restart_guard();
   
   SensESPAppBuilder builder;
-  builder.set_hostname("sensesp-anchor");
-  builder.set_wifi_access_point("SensESP-anchor", "948171!!");
+  builder.set_hostname("anchor-guard");
+  builder.set_wifi_access_point("anchor-guard", "pass12345");
   ::sensesp::sensesp_app = builder.get_app();
   
   configTime(0, 0, "pool.ntp.org");
@@ -981,51 +1027,96 @@ void loop() {
   // =====================================================
   // WATCHDOG: WiFi & WebSocket connection monitoring
   // =====================================================
-  // Fail-fast approach: restart ESP32 on connection loss
-  // This is more reliable than trying to recover broken state
+  // Fail-safe approach: restart ESP32 on prolonged connection loss
+  // This follows ESP32 firmware best practices for reliability
   static unsigned long wifi_disconnect_since = 0;
-  static bool was_connected = false;
+  static unsigned long ws_disconnect_since = 0;
+  static bool ws_was_connected = false;
+  static bool wifi_was_connected = false;
 
   // --- WiFi Watchdog ---
-  if (!WiFi.isConnected()) {
-    if (wifi_disconnect_since == 0) {
-      wifi_disconnect_since = now_ms;
-      ESP_LOGW(ANCHOR_TAG, "WiFi: disconnected, will restart in 30 seconds");
-    }
-
-    // After 30 seconds without WiFi, restart ESP32
-    if (now_ms - wifi_disconnect_since > 30000UL) {
-      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WiFi lost - RESTARTING ESP32");
-      delay(100);
-      ESP.restart();
-    }
-  } else {
+  if (WiFi.isConnected()) {
+    wifi_was_connected = true;
     wifi_disconnect_since = 0;
+  } else {
+    wifi_mode_t wifi_mode = WiFi.getMode();
+    if (!wifi_was_connected ||
+        wifi_mode == WIFI_MODE_AP ||
+        wifi_mode == WIFI_MODE_APSTA) {
+      // Skip watchdog before first WiFi connection or while in AP setup mode.
+      wifi_disconnect_since = 0;
+    } else {
+      if (wifi_disconnect_since == 0) {
+        wifi_disconnect_since = now_ms;
+        ESP_LOGW(ANCHOR_TAG, "WiFi: disconnected, will restart in 30 seconds");
+      }
+
+      // After 30 seconds without WiFi, restart ESP32
+      if (now_ms - wifi_disconnect_since > 30000UL) {
+        ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WiFi lost - RESTARTING ESP32");
+        delay(100);
+        ESP.restart();
+      }
+    }
   }
 
   // --- WebSocket Watchdog ---
-  // Restart on any WebSocket failure (even if we never connected).
-  static unsigned long ws_disconnect_since = 0;
-  const unsigned long ws_connect_timeout_ms = 5000;
+  // Immediate restart on WS disconnect to recover from server-side backpressure drops.
+  // Only triggers if WiFi is up and the WS was connected before.
+  const unsigned long ws_watchdog_timeout_ms = 0;  // 0 = immediate
 
   if (g_ws_state == SKWSConnectionState::kSKWSConnected) {
-    was_connected = true;
+    ws_was_connected = true;
     ws_disconnect_since = 0;
-  } else if (WiFi.isConnected()) {
+  } else if (WiFi.isConnected() && ws_was_connected) {
     if (ws_disconnect_since == 0) {
       ws_disconnect_since = now_ms;
-      ESP_LOGW(ANCHOR_TAG,
-               "WebSocket: disconnected, will restart in %lums unless connected",
-               ws_connect_timeout_ms);
+      if (g_ws_restart_blocked_until_ms > now_ms) {
+        ESP_LOGW(ANCHOR_TAG,
+                 "WebSocket: disconnected (was connected), restart suppressed for %lu ms",
+                 g_ws_restart_blocked_until_ms - now_ms);
+      } else if (ws_watchdog_timeout_ms == 0) {
+        ESP_LOGW(ANCHOR_TAG,
+                 "WebSocket: disconnected (was connected), restarting immediately");
+      } else {
+        ESP_LOGW(ANCHOR_TAG,
+                 "WebSocket: disconnected (was connected), will restart in %lu seconds if not reconnected",
+                 ws_watchdog_timeout_ms / 1000);
+      }
     }
 
-    if (was_connected || (now_ms - ws_disconnect_since >= ws_connect_timeout_ms)) {
-      ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WebSocket failure - RESTARTING ESP32");
+    if (g_ws_restart_blocked_until_ms > now_ms) {
+      // Suppressed due to restart backoff.
+      return;
+    }
+
+    if (ws_watchdog_timeout_ms == 0 ||
+        now_ms - ws_disconnect_since >= ws_watchdog_timeout_ms) {
+      if (ws_watchdog_timeout_ms == 0) {
+        ESP_LOGE(ANCHOR_TAG, "WATCHDOG: WebSocket disconnected - RESTARTING ESP32");
+      } else {
+        ESP_LOGE(ANCHOR_TAG,
+                 "WATCHDOG: WebSocket disconnected for %lu seconds - RESTARTING ESP32",
+                 ws_watchdog_timeout_ms / 1000);
+      }
+      g_ws_watchdog_restart = true;
+      g_ws_last_uptime_ms = now_ms;
       delay(100);
       ESP.restart();
     }
   } else {
     ws_disconnect_since = 0;
+  }
+
+  // Clear restart backoff after a stable connection period.
+  if (g_ws_state == SKWSConnectionState::kSKWSConnected &&
+      g_connection_time > 0 &&
+      now_ms - g_connection_time > 120000UL) {
+    if (g_ws_restart_attempts != 0 || g_ws_restart_blocked_until_ms != 0) {
+      g_ws_restart_attempts = 0;
+      g_ws_restart_blocked_until_ms = 0;
+      ESP_LOGI(ANCHOR_TAG, "WS restart backoff cleared after stable connection");
+    }
   }
 
   // --- Health diagnostics (every 10 minutes) ---

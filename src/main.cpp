@@ -933,10 +933,10 @@ void loop() {
     initial_heartbeat_sent = false;
   }
 
-  // Send heartbeat every 5 seconds
+  // Send heartbeat every 15 seconds (reduced from 5s to prevent server backpressure)
   static unsigned long last_heartbeat_ms = 0;
   if (g_ws_state == SKWSConnectionState::kSKWSConnected && anchor) {
-    if (now_ms - last_heartbeat_ms >= 5000) {
+    if (now_ms - last_heartbeat_ms >= 15000) {
       anchor->sendHeartbeat();
       last_heartbeat_ms = now_ms;
     }

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(where pio:*)",
+      "Bash(where:*)",
+      "Bash(dir /s /b *.exe)",
+      "Bash(findstr:*)"
+    ]
+  }
+}

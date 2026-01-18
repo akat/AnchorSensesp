@@ -69,6 +69,7 @@ class AnchorController : public FileSystemSaveable {
   const unsigned long command_debounce_ms_ = 250;
   String last_command_state_ = "";
   bool processing_command_ = false;
+  bool state_changed_ = false;  // Flag για deferred publish από tick()
 
   // Εξωτερικές είσοδοι
   int ext_up_gpio = 32;
@@ -397,7 +398,7 @@ class AnchorController : public FileSystemSaveable {
     op_end_ms = 0;
     op_start_ms = 0;
     neutral_waiting = false;
-    publishState_();
+    state_changed_ = true;  // Deferred publish από tick() - αποφυγή deadlock σε WS callback
     ESP_LOGI(ANCHOR_TAG, "Motor STOPPED: %s", reason);
   }
   
@@ -416,7 +417,7 @@ class AnchorController : public FileSystemSaveable {
       ESP_LOGI(ANCHOR_TAG, "Motor START: DOWN for %.1fs", seconds);
     }
 
-    publishState_();
+    state_changed_ = true;  // Deferred publish από tick()
   }
   
   void runDirection_(RunState dir, float seconds) {
@@ -699,6 +700,12 @@ class AnchorController : public FileSystemSaveable {
   
   void tick() {
     const unsigned long now_ms = millis();
+
+    // Deferred state publish (αποφυγή deadlock σε WS callback)
+    if (state_changed_) {
+      state_changed_ = false;
+      publishState_();
+    }
 
     // SAFETY CHECK FIRST: Stop if disconnected while running
     extern SKWSConnectionState g_ws_state;

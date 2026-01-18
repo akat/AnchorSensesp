@@ -77,11 +77,27 @@ class AnchorController : public FileSystemSaveable {
   bool ext_input_active_high = false;  // Active LOW με pull-up (relay κλειστό = LOW)
   int ext_input_debounce_ms = 50;
   unsigned long last_ext_in_sample_ms = 0;
-  bool ext_up_filtered = false, ext_down_filtered = false;
-  unsigned long ext_up_stable_ms = 0, ext_down_stable_ms = 0;
-  bool ext_up_state = false, ext_down_state = false;
   String ext_source = "NONE";
   bool external_control_active = false;
+
+  // Debounce state για external inputs
+  struct DebounceState {
+    bool raw = false;
+    bool filtered = false;
+    bool last_state = false;
+    unsigned long stable_ms = 0;
+
+    void update(bool input, unsigned long now, unsigned long debounce_ms) {
+      raw = input;
+      if (raw != last_state) {
+        stable_ms = now;
+        last_state = raw;
+      } else if (now - stable_ms >= debounce_ms) {
+        filtered = raw;
+      }
+    }
+  };
+  DebounceState ext_up_db_, ext_down_db_;
 
   // "Virtual" buzzer: μόνο SignalK event
   float base_threshold_m = 20.0f, step_m = 10.0f;
@@ -137,6 +153,53 @@ class AnchorController : public FileSystemSaveable {
     digitalWrite(relay_up_pin,   relays_active_high ? LOW : HIGH);
     digitalWrite(relay_down_pin, relays_active_high ? HIGH : LOW);
     relays_on_ = true;
+  }
+
+  // Signal K helpers - unified template to avoid code duplication
+  std::shared_ptr<SKWSClient> getConnectedWs_() {
+    auto app = ::sensesp::SensESPApp::get();
+    if (!app) return nullptr;
+    auto ws = app->get_ws_client();
+    if (!ws) return nullptr;
+    extern SKWSConnectionState g_ws_state;
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return nullptr;
+    return ws;
+  }
+
+  template<typename T>
+  void sendSkDelta_(const char* path, T value, bool with_priority = true) {
+    auto ws = this->getConnectedWs_();
+    if (!ws) return;
+
+    StaticJsonDocument<512> doc;
+    JsonObject root = doc.to<JsonObject>();
+    root["context"] = "vessels.self";
+    if (with_priority) root["priority"] = "instant";
+    JsonArray updates = root["updates"].to<JsonArray>();
+    JsonObject upd = updates.add<JsonObject>();
+    JsonObject src = upd["source"].to<JsonObject>();
+    src["label"] = "anchorSensor";
+    JsonArray values = upd["values"].to<JsonArray>();
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
+    v["value"] = value;
+    String payload;
+    serializeJson(doc, payload);
+    ws->sendTXT(payload);
+  }
+
+  // Convenience wrappers
+  void sendSkDeltaBool_(const char* path, bool value) { sendSkDelta_(path, value); }
+  void sendSkDeltaString_(const char* path, const String& value) { sendSkDelta_(path, value); }
+  void sendSkDeltaFloat_(const char* path, float value) { sendSkDelta_(path, value); }
+  void sendSkDeltaInt_(const char* path, int value) { sendSkDelta_(path, value); }
+
+  // Helper to add a value to a JsonArray (for batch sends)
+  template<typename T>
+  void addSkValue_(JsonArray& values, const char* path, T value) {
+    JsonObject v = values.add<JsonObject>();
+    v["path"] = path;
+    v["value"] = value;
   }
 
   void updateChainCounter() {
@@ -226,33 +289,8 @@ class AnchorController : public FileSystemSaveable {
   }
   
   void sendChainUpdate_() {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-
-    StaticJsonDocument<512> doc;
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
-    JsonArray values = upd["values"].to<JsonArray>();
-
-    JsonObject v1 = values.add<JsonObject>();
-    v1["path"] = "sensors.akat.anchor.chainOut";
-    v1["value"] = chain_out_meters;
-    
-    JsonObject v2 = values.add<JsonObject>();
-    v2["path"] = "sensors.akat.anchor.chainPulses";
-    v2["value"] = chain_pulse_count;
-    
-    String payload;
-    serializeJson(doc, payload);
-    ws->sendTXT(payload);
+    sendSkDelta_("sensors.akat.anchor.chainOut", chain_out_meters, false);
+    sendSkDelta_("sensors.akat.anchor.chainPulses", chain_pulse_count, false);
   }
   
   void publishState_() {
@@ -269,40 +307,22 @@ class AnchorController : public FileSystemSaveable {
     return "unknown";
   }
   
+  bool readExtInput_(int gpio) {
+    if (gpio < 0) return false;
+    return digitalRead(gpio) == (ext_input_active_high ? HIGH : LOW);
+  }
+
   void handleExternalInputs_() {
     unsigned long now = millis();
     if (now - last_ext_in_sample_ms < 10) return;
     last_ext_in_sample_ms = now;
-    
-    // Διάβασε τις εισόδους (LOW = active με pull-up)
-    bool ext_up_raw = false;
-    bool ext_down_raw = false;
-    
-    if (ext_up_gpio >= 0) {
-      ext_up_raw = (digitalRead(ext_up_gpio) == (ext_input_active_high ? HIGH : LOW));
-    }
-    if (ext_down_gpio >= 0) {
-      ext_down_raw = (digitalRead(ext_down_gpio) == (ext_input_active_high ? HIGH : LOW));
-    }
-    
-    // Debounce UP
-    if (ext_up_raw != ext_up_state) { 
-      ext_up_stable_ms = now; 
-      ext_up_state = ext_up_raw; 
-    } else if (now - ext_up_stable_ms >= (unsigned long)ext_input_debounce_ms) {
-      ext_up_filtered = ext_up_raw;
-    }
-    
-    // Debounce DOWN
-    if (ext_down_raw != ext_down_state) { 
-      ext_down_stable_ms = now; 
-      ext_down_state = ext_down_raw; 
-    } else if (now - ext_down_stable_ms >= (unsigned long)ext_input_debounce_ms) {
-      ext_down_filtered = ext_down_raw;
-    }
-    
+
+    // Read and debounce inputs
+    ext_up_db_.update(readExtInput_(ext_up_gpio), now, ext_input_debounce_ms);
+    ext_down_db_.update(readExtInput_(ext_down_gpio), now, ext_input_debounce_ms);
+
     // Conflict detection
-    if (ext_up_filtered && ext_down_filtered) {
+    if (ext_up_db_.filtered && ext_down_db_.filtered) {
       if (!external_control_active || ext_source != "CONFLICT") {
         ESP_LOGW(ANCHOR_TAG, "External input CONFLICT: both UP and DOWN active!");
         ext_source = "CONFLICT"; 
@@ -314,15 +334,15 @@ class AnchorController : public FileSystemSaveable {
     }
     
     // Determine state
-    RunState nextInputState = IDLE; 
+    RunState nextInputState = IDLE;
     String newSource = "NONE";
-    
-    if (ext_up_filtered) { 
-      nextInputState = RUNNING_UP;   
-      newSource = "UP"; 
-    } else if (ext_down_filtered) { 
-      nextInputState = RUNNING_DOWN; 
-      newSource = "DOWN"; 
+
+    if (ext_up_db_.filtered) {
+      nextInputState = RUNNING_UP;
+      newSource = "UP";
+    } else if (ext_down_db_.filtered) {
+      nextInputState = RUNNING_DOWN;
+      newSource = "DOWN";
     }
     
     // State changed?
@@ -482,114 +502,9 @@ class AnchorController : public FileSystemSaveable {
     processing_command_ = false;
   }
 
-  // Signal K helpers
-  void sendSkDeltaBool_(const char* path, bool value) {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-
-    StaticJsonDocument<384> doc;
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    root["priority"] = "instant";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
-    JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>();
-    v["path"] = path;
-    v["value"] = value;
-    String payload;
-    serializeJson(doc, payload);
-    ws->sendTXT(payload);
-  }
-
-  void sendSkDeltaString_(const char* path, const String& value) {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-
-    StaticJsonDocument<512> doc;
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    root["priority"] = "instant";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
-    JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>();
-    v["path"] = path;
-    v["value"] = value;
-    String payload;
-    serializeJson(doc, payload);
-    ws->sendTXT(payload);
-  }
-
-  void sendSkDeltaFloat_(const char* path, float value) {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-
-    StaticJsonDocument<384> doc;
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    root["priority"] = "instant";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
-    JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>();
-    v["path"] = path;
-    v["value"] = value;
-    String payload;
-    serializeJson(doc, payload);
-    ws->sendTXT(payload);
-  }
-
-  void sendSkDeltaInt_(const char* path, int value) {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
-    if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-
-    StaticJsonDocument<384> doc;
-    JsonObject root = doc.to<JsonObject>();
-    root["context"] = "vessels.self";
-    root["priority"] = "instant";
-    JsonArray updates = root["updates"].to<JsonArray>();
-    JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
-    JsonArray values = upd["values"].to<JsonArray>();
-    JsonObject v = values.add<JsonObject>();
-    v["path"] = path;
-    v["value"] = value;
-    String payload;
-    serializeJson(doc, payload);
-    ws->sendTXT(payload);
-  }
-  
   void sendHeartbeat() {
-    auto app = ::sensesp::SensESPApp::get();
-    if (!app) return;
-    auto ws = app->get_ws_client();
+    auto ws = this->getConnectedWs_();
     if (!ws) return;
-    extern SKWSConnectionState g_ws_state;
-    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
     ESP_LOGD(ANCHOR_TAG, "DEBUG: Preparing heartbeat, free heap: %u", ESP.getFreeHeap());
 
@@ -598,25 +513,13 @@ class AnchorController : public FileSystemSaveable {
     root["context"] = "vessels.self";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
-    JsonObject src = upd["source"].to<JsonObject>();
-    src["label"] = "anchorSensor";
+    upd["source"]["label"] = "anchorSensor";
     JsonArray values = upd["values"].to<JsonArray>();
 
-    JsonObject v1 = values.add<JsonObject>();
-    v1["path"] = "sensors.akat.anchor.enabled";
-    v1["value"] = enabled;
-
-    JsonObject v2 = values.add<JsonObject>();
-    v2["path"] = "sensors.akat.anchor.lastUpdate";
-    v2["value"] = isoTimestamp();
-
-    JsonObject v3 = values.add<JsonObject>();
-    v3["path"] = "sensors.akat.anchor.chainOut";
-    v3["value"] = chain_out_meters;
-
-    JsonObject v4 = values.add<JsonObject>();
-    v4["path"] = "sensors.akat.anchor.state";
-    v4["value"] = stateToString_();
+    this->addSkValue_(values, "sensors.akat.anchor.enabled", enabled);
+    this->addSkValue_(values, "sensors.akat.anchor.lastUpdate", isoTimestamp());
+    this->addSkValue_(values, "sensors.akat.anchor.chainOut", chain_out_meters);
+    this->addSkValue_(values, "sensors.akat.anchor.state", stateToString_());
 
     String payload;
     serializeJson(doc, payload);
@@ -625,23 +528,21 @@ class AnchorController : public FileSystemSaveable {
     ESP_LOGD(ANCHOR_TAG, "DEBUG: Heartbeat sent, free heap: %u", ESP.getFreeHeap());
   }
   
+  // Check if SK listener callback should be processed (connected + settling done)
+  bool shouldProcessSkCallback_() {
+    extern SKWSConnectionState g_ws_state;
+    extern unsigned long g_connection_time;
+    if (g_ws_state != SKWSConnectionState::kSKWSConnected) return false;
+    if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) return false;
+    return true;
+  }
+
   void attachSignalK() {
     sk_command_listener = new StringSKListener("sensors.akat.anchor.command", 300);
     sk_command_listener->connect_to(new LambdaConsumer<String>([this](const String& cmd_state) {
-      extern SKWSConnectionState g_ws_state;
-      extern unsigned long g_connection_time;
-
       ESP_LOGI(ANCHOR_TAG, "DEBUG: Command listener triggered, free heap: %u", ESP.getFreeHeap());
-
-      // FIX: Ignore updates when not connected
-      if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
-        ESP_LOGD(ANCHOR_TAG, "Command ignored - not connected");
-        return;
-      }
-
-      // FIX: Ignore updates during connection settling period (2 seconds)
-      if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) {
-        ESP_LOGD(ANCHOR_TAG, "Command ignored - settling period");
+      if (!shouldProcessSkCallback_()) {
+        ESP_LOGD(ANCHOR_TAG, "Command ignored - not ready");
         return;
       }
 
@@ -666,15 +567,11 @@ class AnchorController : public FileSystemSaveable {
 
       ESP_LOGI(ANCHOR_TAG, "DEBUG: Command processing complete, free heap: %u", ESP.getFreeHeap());
     }));
-    
+
     sk_chain_set_listener = new FloatSKListener("sensors.akat.anchor.chainOutSet", 500);
     sk_chain_set_listener->connect_to(new LambdaConsumer<float>([this](float meters) {
-      extern SKWSConnectionState g_ws_state;
-      extern unsigned long g_connection_time;
-      
-      if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-      if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) return;
-      
+      if (!shouldProcessSkCallback_()) return;
+
       chain_out_meters = meters;
       if (chain_out_meters < 0.0f) chain_out_meters = 0.0f;
       chain_pulse_count = (int)(chain_out_meters / chain_calibration);
@@ -685,15 +582,10 @@ class AnchorController : public FileSystemSaveable {
       last_chain_save_ms = millis();
       sendChainUpdate_();
     }));
-    
+
     sk_chain_reset_listener = new BoolSKListener("sensors.akat.anchor.resetChainCounter", 500);
     sk_chain_reset_listener->connect_to(new LambdaConsumer<bool>([this](bool reset) {
-      extern SKWSConnectionState g_ws_state;
-      extern unsigned long g_connection_time;
-      
-      if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
-      if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) return;
-      
+      if (!shouldProcessSkCallback_()) return;
       if (reset) resetChainCounter();
     }));
   }

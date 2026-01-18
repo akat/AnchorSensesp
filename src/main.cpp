@@ -493,6 +493,7 @@ class AnchorController : public FileSystemSaveable {
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
+    root["priority"] = "instant";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();
@@ -505,7 +506,7 @@ class AnchorController : public FileSystemSaveable {
     serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
-  
+
   void sendSkDeltaString_(const char* path, const String& value) {
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
@@ -517,6 +518,7 @@ class AnchorController : public FileSystemSaveable {
     StaticJsonDocument<512> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
+    root["priority"] = "instant";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();
@@ -529,7 +531,7 @@ class AnchorController : public FileSystemSaveable {
     serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
-  
+
   void sendSkDeltaFloat_(const char* path, float value) {
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
@@ -541,6 +543,7 @@ class AnchorController : public FileSystemSaveable {
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
+    root["priority"] = "instant";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();
@@ -553,7 +556,7 @@ class AnchorController : public FileSystemSaveable {
     serializeJson(doc, payload);
     ws->sendTXT(payload);
   }
-  
+
   void sendSkDeltaInt_(const char* path, int value) {
     auto app = ::sensesp::SensESPApp::get();
     if (!app) return;
@@ -565,6 +568,7 @@ class AnchorController : public FileSystemSaveable {
     StaticJsonDocument<384> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
+    root["priority"] = "instant";
     JsonArray updates = root["updates"].to<JsonArray>();
     JsonObject upd = updates.add<JsonObject>();
     JsonObject src = upd["source"].to<JsonObject>();

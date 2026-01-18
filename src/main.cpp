@@ -586,6 +586,8 @@ class AnchorController : public FileSystemSaveable {
     extern SKWSConnectionState g_ws_state;
     if (g_ws_state != SKWSConnectionState::kSKWSConnected) return;
 
+    ESP_LOGD(ANCHOR_TAG, "DEBUG: Preparing heartbeat, free heap: %u", ESP.getFreeHeap());
+
     StaticJsonDocument<768> doc;
     JsonObject root = doc.to<JsonObject>();
     root["context"] = "vessels.self";
@@ -613,7 +615,9 @@ class AnchorController : public FileSystemSaveable {
 
     String payload;
     serializeJson(doc, payload);
+    ESP_LOGD(ANCHOR_TAG, "DEBUG: Sending heartbeat payload: %s", payload.c_str());
     ws->sendTXT(payload);
+    ESP_LOGD(ANCHOR_TAG, "DEBUG: Heartbeat sent, free heap: %u", ESP.getFreeHeap());
   }
   
   void attachSignalK() {
@@ -621,32 +625,41 @@ class AnchorController : public FileSystemSaveable {
     sk_command_listener->connect_to(new LambdaConsumer<String>([this](const String& cmd_state) {
       extern SKWSConnectionState g_ws_state;
       extern unsigned long g_connection_time;
-      
+
+      ESP_LOGI(ANCHOR_TAG, "DEBUG: Command listener triggered, free heap: %u", ESP.getFreeHeap());
+
       // FIX: Ignore updates when not connected
       if (g_ws_state != SKWSConnectionState::kSKWSConnected) {
         ESP_LOGD(ANCHOR_TAG, "Command ignored - not connected");
         return;
       }
-      
+
       // FIX: Ignore updates during connection settling period (2 seconds)
       if (g_connection_time > 0 && (millis() - g_connection_time < 2000)) {
         ESP_LOGD(ANCHOR_TAG, "Command ignored - settling period");
         return;
       }
-      
+
       ESP_LOGI(ANCHOR_TAG, "Command received: %s", cmd_state.c_str());
-      
+
       if (cmd_state == "running_up") {
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: Processing running_up command");
         if (state != RUNNING_UP) runDirection_(RUNNING_UP, 3600.0f);
       } else if (cmd_state == "running_down") {
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: Processing running_down command");
         if (state != RUNNING_DOWN) runDirection_(RUNNING_DOWN, 3600.0f);
       } else if (cmd_state == "freefall") {
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: Processing freefall command");
         runDirection_(RUNNING_DOWN, 0.0f);
       } else if (cmd_state == "idle") {
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: Processing idle command");
         if (state != IDLE) stopNow_("command:idle");
       } else if (cmd_state == "reset_counter") {
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: Processing reset_counter command");
         resetChainCounter();
       }
+
+      ESP_LOGI(ANCHOR_TAG, "DEBUG: Command processing complete, free heap: %u", ESP.getFreeHeap());
     }));
     
     sk_chain_set_listener = new FloatSKListener("sensors.akat.anchor.chainOutSet", 500);
@@ -919,6 +932,8 @@ void setup() {
         SKWSConnectionState prev_state = g_ws_state;
         g_ws_state = state;
 
+        ESP_LOGI(ANCHOR_TAG, "DEBUG: WS state change: %d -> %d, free heap: %u", (int)prev_state, (int)state, ESP.getFreeHeap());
+
         switch (state) {
           case SKWSConnectionState::kSKWSDisconnected:
             ESP_LOGW(ANCHOR_TAG, "SignalK WebSocket: Disconnected");
@@ -1125,5 +1140,21 @@ void loop() {
     last_health_log = now_ms;
     ESP_LOGI(ANCHOR_TAG, "Health: Free heap=%u bytes, uptime=%lu min",
              ESP.getFreeHeap(), now_ms / 60000UL);
+  }
+
+  // --- Memory health check ---
+  const uint32_t min_free_heap = 50000;  // 50KB minimum
+  static bool memory_warning_logged = false;
+  uint32_t free_heap = ESP.getFreeHeap();
+  if (free_heap < min_free_heap) {
+    if (!memory_warning_logged) {
+      ESP_LOGW(ANCHOR_TAG, "MEMORY WARNING: Free heap %u < %u, restarting in 5 seconds", free_heap, min_free_heap);
+      memory_warning_logged = true;
+      // Delay restart to allow logging
+      delay(5000);
+      ESP.restart();
+    }
+  } else {
+    memory_warning_logged = false;
   }
 }
